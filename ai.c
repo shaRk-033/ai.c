@@ -105,6 +105,7 @@ struct gpt
 struct DecoderCache{
     float *mean;
     float *var;
+    float *causal_attention
 
 };
 
@@ -119,7 +120,7 @@ void relu(float *x, int size)
 void matmul(const float *inp, const float *weight, float *bias, float *out, int m, int k, int n, int B)
 {
 
-#pragma omp parallel for collapse(2)
+    #pragma omp parallel for collapse(2)
     for (int batch = 0; batch < B; batch++)
     {
         for (int i = 0; i < m; i++)
@@ -144,7 +145,7 @@ void matmul(const float *inp, const float *weight, float *bias, float *out, int 
 // Transposing and matrix mul gets lil bit hairy, i tried on a napkin first
 void matmul_backprop(const float *inp, const float *weight, const float *dout, float *din, float *dweight, float *dbias, int m, int k, int n, int B)
 {
-#pragma omp parallel for collapse(2)
+    #pragma omp parallel for collapse(2)
     for (int i = 0; i < B; i++)
     {
         for (int j = 0; j < m; j++)
@@ -255,11 +256,31 @@ void layernorm(const float *inp, struct LayerNorm ln, float *out, float *mean, f
         }
     }
 }
+void multilayer_perceptron(struct MLP mlp, int B, int T, int C)
+{
+    float *c_fc = (float *)calloc(B * T * 4 * C, sizeof(float));
+    float *c_proj = (float *)calloc(B * T * C, sizeof(float));
+    float *d_fc = (float *)calloc(B * T * 4 * C, sizeof(float));
+    float *d_proj = (float *)calloc(B * T * C, sizeof(float));
+    matmul(mlp.input, mlp.c_fc_weight, mlp.c_fc_bias, c_fc, T, C, 4 * C, B);
+    relu(c_fc, B * T * 4 * C);
+    matmul(c_fc, mlp.c_proj_weight, mlp.c_proj_bias, c_proj, T, 4 * C, C, B);
+    mlp.output = c_proj;
+    free(c_fc);
+    free(c_proj);
+    free(d_fc);
+}
 
-float *CausalAttention(const float *input, float *output, struct AttentionBlock attn, int B, int T, int C, int num_heads)
+void mlp_backprop(){
+
+}
+
+
+void CausalAttention(struct AttentionBlock attn, int B, int T, int C, int num_heads, struct DecoderCache dc)
 {
     assert(C % num_heads == 0);
     int head_size = C / num_heads;
+    int N = num_heads;
     // --------- Stage 1-----------
     // inp @ qkv = B, T, C @ C, 3C = B, T, 3C
     // --------- Stage 2-----------
@@ -270,68 +291,58 @@ float *CausalAttention(const float *input, float *output, struct AttentionBlock 
     // attention score transpose(1,2) = B, T, N, H
     // B, T, N, H @ C, C + 1,C = B, T, C--->output
     float *qkv = (float *)calloc(B * T * num_heads * 3 * head_size, sizeof(float));
-    float *attn_raw = (float *)calloc(B * T * num_heads * T, sizeof(float));
-    // Stage 1
-    matmul(input, attn.attn_weight, attn.attn_bias, qkv, T, C, 3 * C, B);
+    matmul(attn.input, attn.attn_weight, attn.attn_bias, qkv, T, C, 3 * C, B);
+    float *attn_scores = (float *)calloc(B * N * T * T, sizeof(float));
+    float *causal_attention = (float *)calloc(B * T * C, sizeof(float));
     #pragma omp parallel for collapse(3)
-    for (int i = 0; i < B; i++)
-    {
-        for (int j = 0; j < T; j++)
-        {
-            // Self attention and masking, Stage 2
-            // q @ k.T = N, T, H @ N, H, T = N, T, T
-            for (int x = 0; x < num_heads; x++)
-            {
-                float *query = qkv + i * T * 3 * C + j * 3 * C;
-                float norm = 1.0f / sqrt(head_size);
-                float val = 0.0f;
+    for(int i = 0; i < B; i++){
+        for(int n = 0; n < N; n++){
+            for(int j = 0; j < T; j++){
+            
+                float *query = qkv + i * T * 3 * C + j * 3 * C + n * head_size;
                 float maxi = -INFINITY;
-                for (int t = 0; t < T; t++)
-                { // This loop ensures we dont look at future tokens
-                    if(t <= j){
-                        float *key = qkv + i * T * 3 * C + t * 3 * C + C;
-                        for (int y = 0; y < head_size; y++)
-                        {
-                            val += query[x * head_size + y] * key[x * head_size + y];
-                        }
-                        val *= norm;
-                        attn_raw[i * num_heads * T * T + x * T * T + j * T + t] = val;
-                        maxi = maxi>val?maxi:val;
-                    }
-                    else{
-                        attn_raw[i * num_heads * T * T + x * T * T + j * T + t] = -INFINITY;
-                    }
-                }
-
-                // softmax, copypasta
+                // stage 2--> Q @ K
+                for(int k = 0; k < T; k++){
+                    // self attention is calculated and simultaneously future time steps are masked
                 
-                float sum = 0.0f;
-                for (int t = 0; t < T; t++)
-                {
-                    sum += exp(attn_raw[i * num_heads * T * T + x * T * T + j * T + t] - maxi);
+                    float *key = qkv + i * T * 3 * C + k * 3 * C + n * head_size + C;
+                    float score = 0.0f;
+                    for(int h = 0; h < head_size; h++){
+                        score += (query[h] * key[h])/(sqrt(head_size));
+                    }
+                    attn_scores[i * N * T * T + n * T * T + j * T + k] = score;
+                    maxi = maxi > score ? maxi : score;                    
                 }
-                int ind = i * num_heads * T * T + x * T * T + j * T;
-                for (int t = 0; t < T; t++)
-                {
-                    if(t<=j){attn_raw[ind + t] = attn_raw[ind + t] - maxi - log(sum);}
+                // we have calculated scores for a single row in the T x T self att matrix, now we apply softmax and matmul with V
+                //softmax(x) = exp(x - max)/sum(exp(x - max))
+                float expsum = 0.0f;
+                for(int k = 0; k < T; k++){
+                    if(k<=j){
+                        expsum += exp(attn_scores[i * N * T * T + n * T * T + j * T + k] - maxi); 
+                    }
                     else{
-                        attn_raw[ind + t] = 0;
+                        attn_scores[i * N * T * T + n * T * T + j * T + k] = -INFINITY;
                     }
                 }
-                // Stage 3
-                for (int t = 0; t <= j; t++)
-                {
-                    float *value = qkv + i * T * 3 * C + t * 3 * C + 2 * C;
-                    for (int y = 0; y < head_size; y++)
-                    {
-                        output[i * T * C + j * C + x * head_size + y] = attn_raw[i * num_heads * T * T + x * T * T + j * T + t] * value[x * head_size + y];
+                for(int k = 0; k < T; k++){
+                    attn_scores[i * N * T * T + n * T * T + j * T + k] = exp(attn_scores[i * N * T * T + n * T * T + j * T + k] - maxi)/expsum;
+                }
+                // stage 3 --> attn_scores @ V
+                for(int k = 0; k < T; k++){
+                    float *value = qkv + i * T * 3 * C + k * 3 * C + n * head_size + 2 * C;
+                    for(int h = 0; h < head_size; h++){
+                         causal_attention[i * T * C + j * C + n * head_size + h] += attn_scores[i * N * T * T + n * T * T + j * T + k] * value[h];
                     }
                 }
-            }
-        }
+            }  
+        }  
     }
-    return attn_raw;
-    // one of the most annoying and fun things to code
+    // output projection layer
+    dc.causal_attention = causal_attention;
+    free(qkv);
+    matmul(causal_attention, attn.proj_weight, attn.proj_bias, attn.output, T, C, C, B);
+    free(attn_scores);
+    free(causal_attention);// one of the most annoying and fun things to code
 }
 
 void causal_attention_backprop(float *output, float *input, float *dout, float *din, float *dattn_weights, float *dattn_bias, int B, int T, int C, int num_heads){
@@ -467,8 +478,8 @@ void initialize_attention(struct AttentionBlock *attn, struct Config config) {
 
     xavier_normal_init(attn->attn_weight, config.d_model, 3 * config.d_model, 1);
     xavier_normal_init(attn->proj_weight, config.d_model, config.d_model, 1);
-    xavier_normal_init(attn->attn_bias, 1, 3 * config.d_model, 0);
-    xavier_normal_init(attn->proj_bias, 1, config.d_model, 0);
+    xavier_normal_init(attn->attn_bias, 1, 3 * config.d_model, 1);
+    xavier_normal_init(attn->proj_bias, 1, config.d_model, 1);
 }
 
 void initialize_mlp(struct MLP *mlp, struct Config config) {
