@@ -229,7 +229,7 @@ size_t calculate_total_dgpt_size(int t, int c, int v) {
     total_size += calculate_dlayernorm_size(c);
 
     // dFinal layer size
-    total_size += calculate_final_layer_size(c, v); // Assuming dFinal layer is the same size as Final layer
+    total_size += calculate_final_layer_size(c, v); 
 
     return total_size;
 }
@@ -318,7 +318,7 @@ void map_gpt(struct gpt* model, const char* filename, int b, int t, int c, int v
 
 void unmap_gpt(struct gpt* model, const char* filename, int b, int t, int c, int v) {
     size_t total_size = calculate_total_gpt_size(b, t, c, v);
-    float* map = model->embedding->pos_emb; // Assuming pos_emb points to the start of the mapped file
+    float* map = model->embedding->pos_emb; 
 
     // Free embedding
     free(model->embedding);
@@ -415,7 +415,7 @@ void map_dgpt(struct dGpt* model, const char* filename, int t, int c, int v) {
 
 void unmap_dgpt(struct dGpt* model, const char* filename, int t, int c, int v) {
     size_t total_size = calculate_total_dgpt_size(t, c, v);
-    float* map = model->dembedding->dinp_emb; // Assuming dinp_emb points to the start of the mapped file
+    float* map = model->dembedding->dinp_emb; 
 
     // Free dEmbedding
     free(model->dembedding);
@@ -567,7 +567,7 @@ void unmap_ip_op_array(struct ip_op* model[], int b, int t, int c, int n) {
     }
 
     // Unmap file
-    float* map = model[0]->dec_ip; // Assuming dec_ip points to the start of the mapped file
+    float* map = model[0]->dec_ip; 
     size_t total_size = n * (
         sizeof(float) * (b * t * c +  // dec_ip
                          b * t * c +  // ln_out1
@@ -650,7 +650,7 @@ void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
 }
 void unmap_foo(struct foo* model, int b, int t, int c) {
     // Unmap file
-    float* map = (float*)model->input; // Assuming input points to the start of the mapped file
+    float* map = (float*)model->input;
     size_t total_size = b * (
         sizeof(int) * t +              // input
         sizeof(float) * t * c +        // emb_output
