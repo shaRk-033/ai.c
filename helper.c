@@ -6,6 +6,7 @@
 #include <string.h>
 #include "mapfile.c"
 
+
 struct ip_op{
 
     float *dec_ip;//b, t, c
@@ -63,7 +64,6 @@ struct Embedding{
 struct dEmbedding{
     float *dinp_emb;//v, c
     float *dpos_emb;//t, c
-    float *doutput;//b, t, c
 };
 
 struct AttentionBlock{
@@ -155,6 +155,8 @@ struct dGpt{
 // 3. ip_op containing intermediate inputs, outputs, etc of each decoder layer
 
 // 4. foo containing remaining intermediate inputs, outputs, etc of embedding and final layer
+
+//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 size_t calculate_embedding_size(int t, int c, int v) {
     return (t * c + v * c) * sizeof(float);
 }
@@ -168,7 +170,7 @@ size_t calculate_mlp_size(int c) {
 }
 
 size_t calculate_layernorm_size(int c, int b, int t) {
-    return (2 * c + 2 * 2 * b * t) * sizeof(float);
+    return (2 * c + 2 * b * t) * sizeof(float);
 }
 
 size_t calculate_final_layer_size(int c, int v) {
@@ -197,7 +199,7 @@ size_t calculate_total_gpt_size(int b, int t, int c, int v) {
     return total_size;
 }
 size_t calculate_dembedding_size(int t, int c, int v) {
-    return (v * c + t * c + t * c) * sizeof(float);
+    return (v * c + t * c) * sizeof(float);
 }
 
 size_t calculate_dattentionblock_size(int c) {
@@ -229,11 +231,60 @@ size_t calculate_total_dgpt_size(int t, int c, int v) {
     total_size += calculate_dlayernorm_size(c);
 
     // dFinal layer size
-    total_size += calculate_final_layer_size(c, v); 
+    total_size += calculate_final_layer_size(c, v); // Assuming dFinal layer is the same size as Final layer
 
     return total_size;
 }
+size_t calculate_ip_op_size(int b, int t, int c, int n, int N){
+    int total_size = n * (
+        sizeof(float) * (b * t * c +  // dec_ip
+                         b * t * c +  // ln_out1
+                         b * t +      // mean1
+                         b * t +      // std1
+                         b * t * c +  // att_out
+                         b * t * c +  // causal_attention
+                         b * N * t * t +  // attn_scores
+                         b * t * 3 * c +  // qkv
+                         b * t * c +  // res_out1
+                         b * t * c +  // ln_out2
+                         b * t +      // mean2
+                         b * t +      // std2
+                         b * t * 4 * c +  // mlp_l1_out
+                         b * t * 4 * c +  // gelu_out1
+                         b * t * c +  // mlp_l2_out
+                         b * t * c +  // gelu_out2
+                         b * t * c +  // res_out2
+                         b * t * c +  // dln_out1
+                         b * t * c +  // datt_out
+                         b * t * c +  // dres_out1
+                         b * t * c +  // dln_out2
+                         b * t * 4 * c +  // dmlp_l1_out
+                         b * t * 4 * c +  // dgelu_out1
+                         b * t * c +  // dmlp_l2_out
+                         b * t * c +  // dgelu_out2
+                         b * t * c     // dres_out2
+                         )
+    );  // Calculate total size to map
+    return total_size;
+}
 
+size_t calculate_foo_size(int b, int t, int c){
+    int total_size = b * (
+        sizeof(int) * t +              // input
+        sizeof(float) * t * c +        // emb_output
+        sizeof(float) * t * c +        // fln_output
+        sizeof(float) * t +            // fln_mean
+        sizeof(float) * t +            // fln_std
+        sizeof(float) * t * c +        // fl_output
+        sizeof(float) * t * c +        // demb_output
+        sizeof(float) * t * c +        // dfln_output
+        sizeof(float) * t * c          // dfl_output
+    );
+    return total_size;
+}
+
+
+//--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 void map_gpt(struct gpt* model, const char* filename, int b, int t, int c, int v) {
     size_t total_size = calculate_total_gpt_size(b, t, c, v);
     float* map = mmap_file(filename, total_size);
@@ -304,9 +355,9 @@ void map_gpt(struct gpt* model, const char* filename, int b, int t, int c, int v
     model->lnf->ln1_bias = current_ptr;
     current_ptr += c;
     model->lnf->cache_mean = current_ptr;
-    current_ptr += b*t;
+    current_ptr += b * t;
     model->lnf->cache_var = current_ptr;
-    current_ptr += b*t;
+    current_ptr += b * t;
 
     // Map final layer
     model->final_layer = (struct FinalLayer*)malloc(sizeof(struct FinalLayer));
@@ -356,8 +407,6 @@ void map_dgpt(struct dGpt* model, const char* filename, int t, int c, int v) {
     model->dembedding->dinp_emb = current_ptr;
     current_ptr += v * c;
     model->dembedding->dpos_emb = current_ptr;
-    current_ptr += t * c;
-    model->dembedding->doutput = current_ptr;
     current_ptr += t * c;
 
     // Map dDecoder layers
@@ -439,36 +488,9 @@ void unmap_dgpt(struct dGpt* model, const char* filename, int t, int c, int v) {
     unmap_file(map, total_size);
 }
 
+
 void map_ip_op_array(struct ip_op* model[], const char* filename, int b, int t, int c, int n, int N) {
-    size_t total_size = n * (
-        sizeof(float) * (b * t * c +  // dec_ip
-                         b * t * c +  // ln_out1
-                         b * t +      // mean1
-                         b * t +      // std1
-                         b * t * c +  // att_out
-                         b * t * c +  // causal_attention
-                         b * N * t * t +  // attn_scores
-                         b * t * 3 * c +  // qkv
-                         b * t * c +  // res_out1
-                         b * t * c +  // ln_out2
-                         b * t +      // mean2
-                         b * t +      // std2
-                         b * t * 4 * c +  // mlp_l1_out
-                         b * t * 4 * c +  // gelu_out1
-                         b * t * c +  // mlp_l2_out
-                         b * t * c +  // gelu_out2
-                         b * t * c +  // res_out2
-                         b * t * c +  // dln_out1
-                         b * t * c +  // datt_out
-                         b * t * c +  // dres_out1
-                         b * t * c +  // dln_out2
-                         b * t * 4 * c +  // dmlp_l1_out
-                         b * t * 4 * c +  // dgelu_out1
-                         b * t * c +  // dmlp_l2_out
-                         b * t * c +  // dgelu_out2
-                         b * t * c     // dres_out2
-                         )
-    );  // Calculate total size to map
+    size_t total_size = calculate_ip_op_size(b, t, c, n, N);
 
     float* map = mmap_file(filename, total_size);
     if (!map) {
@@ -481,7 +503,7 @@ void map_ip_op_array(struct ip_op* model[], const char* filename, int b, int t, 
     for (int i = 0; i < n; i++) {
         model[i] = (struct ip_op*)malloc(sizeof(struct ip_op));
 
-        model[i]->dec_ip = current_ptr;
+        model[i]->dec_ip = current_ptr; // memset pointer
         current_ptr += b * t * c;
 
         model[i]->ln_out1 = current_ptr;
@@ -565,53 +587,15 @@ void unmap_ip_op_array(struct ip_op* model[], int b, int t, int c, int n) {
     for (int i = 0; i < b * n; i++) {
         free(model[i]);
     }
-
     // Unmap file
     float* map = model[0]->dec_ip; 
-    size_t total_size = n * (
-        sizeof(float) * (b * t * c +  // dec_ip
-                         b * t * c +  // ln_out1
-                         b * t +      // mean1
-                         b * t +      // std1
-                         b * t * c +  // att_out
-                         b * t * c +  // causal_attention
-                         b * n * t * t +  // attn_scores
-                         b * t * 3 * c +  // qkv
-                         b * t * c +  // res_out1
-                         b * t * c +  // ln_out2
-                         b * t +      // mean2
-                         b * t +      // std2
-                         b * t * 4 * c +  // mlp_l1_out
-                         b * t * 4 * c +  // gelu_out1
-                         b * t * c +  // mlp_l2_out
-                         b * t * c +  // gelu_out2
-                         b * t * c +  // res_out2
-                         b * t * c +  // dln_out1
-                         b * t * c +  // datt_out
-                         b * t * c +  // dres_out1
-                         b * t * c +  // dln_out2
-                         b * t * 4 * c +  // dmlp_l1_out
-                         b * t * 4 * c +  // dgelu_out1
-                         b * t * c +  // dmlp_l2_out
-                         b * t * c +  // dgelu_out2
-                         b * t * c     // dres_out2
-                         )
-    );
+    size_t total_size = calculate_ip_op_size(b, t, c, n, 0);
 
     unmap_file(map, total_size);
 }
+
 void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
-    size_t total_size = b * (
-        sizeof(int) * t +              // input
-        sizeof(float) * t * c +        // emb_output
-        sizeof(float) * t * c +        // fln_output
-        sizeof(float) * t +            // fln_mean
-        sizeof(float) * t +            // fln_std
-        sizeof(float) * t * c +        // fl_output
-        sizeof(float) * t * c +        // demb_output
-        sizeof(float) * t * c +        // dfln_output
-        sizeof(float) * t * c          // dfl_output
-    );
+    size_t total_size = calculate_foo_size(b, t, c);
 
     float* map = mmap_file(filename, total_size);
     if (!map) {
@@ -650,18 +634,8 @@ void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
 }
 void unmap_foo(struct foo* model, int b, int t, int c) {
     // Unmap file
-    float* map = (float*)model->input;
-    size_t total_size = b * (
-        sizeof(int) * t +              // input
-        sizeof(float) * t * c +        // emb_output
-        sizeof(float) * t * c +        // fln_output
-        sizeof(float) * t +            // fln_mean
-        sizeof(float) * t +            // fln_std
-        sizeof(float) * t * c +        // fl_output
-        sizeof(float) * t * c +        // demb_output
-        sizeof(float) * t * c          // dfl_output
-    );
-
+    float* map = (float*)model->input; 
+    size_t total_size = calculate_foo_size(b, t, c);
     // Unmap the memory
     unmap_file(map, total_size);
 }
