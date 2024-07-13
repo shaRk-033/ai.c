@@ -7,7 +7,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "brr.c"
+#include "helper.c"
 #define SQRT_2_OVER_PI 0.7978845608028654
 #define const1 0.5
 #define const2 0.044715
