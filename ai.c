@@ -7,7 +7,7 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
-#include "helper.c"
+#include "brr.c"
 #define SQRT_2_OVER_PI 0.7978845608028654
 #define const1 0.5
 #define const2 0.044715
@@ -22,18 +22,7 @@ struct Config
     int n_layers;
 };
 
-struct Optimizer {
-    float lr;
-    float beta1;
-    float beta2;
-    float epsilon;
-    float *m;
-    float *v;
-    float *t;
-};
-
 void ResidualLayer(float *input1, float *input2, float *output, int size) {
-    printf("hi from residual\n");
     for (int i = 0; i < size; i++) {
         output[i] = input1[i] + input2[i];
     }
@@ -44,15 +33,18 @@ void residual_backprop(float *dinput1, float *dinput2, float *doutput, int size)
         dinput2[i] += doutput[i];
     }
 }
-// // Cosine learning rate scheduler
-// float lr_scheduler(float lr, int step, int warmup_steps, int total_steps) {
-//     if (step < warmup_steps) {
-//         return lr * (step / warmup_steps);
-//     }
-//     return 0.5 * lr * (1 + cos((step - warmup_steps) / (total_steps - warmup_steps) * M_PI));
-// }
+
+// Cosine learning rate scheduler
+float lr_scheduler(float lr, int step, int warmup_steps, int total_steps) {
+    if (step < warmup_steps) {
+        return lr * (step / warmup_steps);
+    }
+    return 0.5 * lr * (1 + cos((step - warmup_steps) / (total_steps - warmup_steps) * M_PI));
+}
+
 // GELU(x)=0.5*x*(1+Tanh(sqrt(2/π) * (x+0.044715*x^3))) tanh approximation refered from https://arxiv.org/pdf/1606.08415.pdf
-void GELU(float *input, float *output, int size){
+void GELU(float *input, float *output, int size)
+{
     for (int i = 0; i < size; i++) {
         float x = input[i];
         output[i] = const1 * x * (1 + tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x)));
@@ -60,7 +52,6 @@ void GELU(float *input, float *output, int size){
 }
 
 void gelu_backprop(float *input, float *dinput, float *doutput, int size) {
-
     for (int i = 0; i < size; i++) {
         float x = input[i];
         float tanh_x = tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x));
@@ -71,7 +62,7 @@ void gelu_backprop(float *input, float *dinput, float *doutput, int size) {
 
 void matmul(const float *inp, const float *weight, float *bias, float *out, int m, int k, int n, int B)
 {
-    
+
     #pragma omp parallel for collapse(2)
     for (int batch = 0; batch < B; batch++)
     {
@@ -317,7 +308,7 @@ void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlo
     float *dqkv = (float *)calloc(B * T * 3 * C, sizeof(float));
     float *dscores = (float *)calloc(B * N * T * T, sizeof(float));
     #pragma omp parallel for collapse(3)
-    
+
     for(int i = 0; i < B; i++){
         for(int j = 0; j < N; j++){
             for(int k = 0; k < T; k++){
@@ -346,7 +337,7 @@ void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlo
                     }
                 }
                 // now attn_raw = (q @ k)/sqrt(H), attn_raw--> T, T; q--> T, H; k--> T, H
-                // dq = dattn_raw @ K 
+                // dq = dattn_raw @ K
                 // dk = dattn_raw @ Q
                 for(int l = 0; l < T; l++){
                     for(int h = 0; h < H; h++){
@@ -396,9 +387,8 @@ float CrossEntropy(float *logits, int *targets, int B, int T, int C)
 }
 
 
-void loss_backward(float *logits, int *targets, int B, int T, int C)
+void loss_backward(float *logits, int *targets, float *dlogits, int B, int T, int C)
 {
-    float *dlogits = (float *)calloc(B * T * C, sizeof(float));
     Softmax(logits, dlogits, B, T, C);
     for (int i = 0; i < B * T; i++)
     {
@@ -409,28 +399,111 @@ void loss_backward(float *logits, int *targets, int B, int T, int C)
     }
 }
 
-void gpt_forward(struct Config config, struct gpt *model, struct ip_op *io[], struct foo *f){
-    int B = config.batch_size;
-    int T = config.seq_len;
-    int C = config.d_model;
-    int N = config.num_heads;
-    int n = config.n_layers;
+void gpt_forward(struct Config *config, struct gpt *model, struct ip_op *io[], struct foo *f){
+    int B = config->batch_size;
+    int T = config->seq_len;
+    int C = config->d_model;
+    int N = config->num_heads;
+    int n = config->n_layers;
     // embeddings layer
     embeddings_layer(f->input, model->embedding->inp_emb, model->embedding->pos_emb, f->emb_output, B, T, C);
     // decoder layers
     for(int i = 0; i < n; i++){
-        if(i==0){layernorm(f->emb_output, io[i]->ln_out1, io[i]->mean1, model->decoder_layer[i]->ln1, io[i]->std1, B, T, C, 1);}
-        else{layernorm(io[i-1]->res_out2, io[i]->ln_out1, io[i]->mean1, model->decoder_layer[i]->ln1, io[i]->std1, B, T, C, 1);}
+        if(i==0){
+            layernorm(f->emb_output, io[i]->ln_out1, io[i]->mean1, model->decoder_layer[i]->ln1, io[i]->std1, B, T, C, 1);
+        }
+        else{
+            layernorm(io[i-1]->res_out2, io[i]->ln_out1, io[i]->mean1, model->decoder_layer[i]->ln1, io[i]->std1, B, T, C, 1);
+        }
+
         CausalAttention(io[i]->ln_out1, io[i]->att_out, model->decoder_layer[i]->causal_attention, io[i], B, T, C, N);
-        if(i==0){ResidualLayer(io[i]->att_out, f->emb_output, io[i]->res_out1, B * T * C);}
-        else{ResidualLayer(io[i]->att_out, io[i-1]->res_out2, io[i]->res_out1, B * T * C);}
+
+        if(i==0){
+            ResidualLayer(io[i]->att_out, f->emb_output, io[i]->res_out1, B * T * C);
+        }
+        else{
+            ResidualLayer(io[i]->att_out, io[i-1]->res_out2, io[i]->res_out1, B * T * C);
+        }
         layernorm(io[i]->res_out1, io[i]->ln_out2, io[i]->mean2, model->decoder_layer[i]->ln2, io[i]->std2, B, T, C, 1);
+
         multilayer_perceptron(io[i]->ln_out2, io[i]->mlp_l1_out, io[i]->mlp_l2_out, io[i]->gelu_out1, io[i]->gelu_out2, model->decoder_layer[i]->mlp, B, T, C);
+
         ResidualLayer(io[i]->mlp_l2_out, io[i]->ln_out2, io[i]->res_out2, B * T * C);
     }
-    // final linear layer
+    // final layer
     layernorm(io[n - 1]->res_out2, f->fln_output, f->fln_mean, model->lnf, f->fln_std, B, T, C, 1);
-    matmul(f->fln_output, model->final_layer->final_weight, model->final_layer->final_bias, f->fl_output, T, C, config.vocab_size, B);
+
+    matmul(f->fln_output, model->final_layer->final_weight, model->final_layer->final_bias, f->fl_output, T, C, config->vocab_size, B);
+}
+void gpt_backward(struct Config *config, struct gpt *model, struct dGpt *dmodel, struct ip_op *io[], struct foo *f){
+    int B = config->batch_size;
+    int T = config->seq_len;
+    int C = config->d_model;
+    int V = config->vocab_size;
+    int N = config->num_heads;
+    int n = config->n_layers;
+    // final layer
+    matmul_backprop(f->fln_output, model->final_layer->final_weight, f->dfl_output, f->dfln_output, dmodel->dfinal_layer->dfinal_weight, dmodel->dfinal_layer->dfinal_bias, T, C, V, B);
+    layernorm_backprop(io[n-1]->res_out2, io[n-1]->dres_out2, f->dfl_output, model->lnf, dmodel->dlnf, f->fln_mean, f->fln_std, B, T, C);
+    for(int i = n-1; i >=0; i++){
+        residual_backprop(io[i]->dres_out1, io[i]->dgelu_out2, io[i]->dres_out2, B * T * C);
+        mlp_backprop(io[i]->ln_out2, io[i]->dln_out2, io[i], model->decoder_layer[i]->mlp, dmodel->ddecoder_layer[i]->dmlp, B, T, C);
+        layernorm_backprop(io[i]->res_out1, io[i]->dres_out1, io[i]->dln_out2, model->decoder_layer[i]->ln2, dmodel->ddecoder_layer[i]->dln2, io[i]->mean2, io[i]->std2, B, T, C);
+        if(i == 0){
+            residual_backprop(io[i]->datt_out, f->demb_output, io[i]->dres_out1, B*T*C);
+        }
+        else{
+            residual_backprop(io[i]->datt_out, io[i-1]->dres_out2, io[i]->dres_out1, B*T*C);
+        }
+        causal_attention_backprop(model->decoder_layer[i]->causal_attention, dmodel->ddecoder_layer[i]->dcausal_attention, io, B, T, C, N);
+
+        if(i == 0){
+            layernorm_backprop(f->emb_output, f->demb_output, io[i]->dln_out1, model->decoder_layer[i]->ln1, dmodel->ddecoder_layer[i]->dln1, io[i]->mean1, io[i]->std1, B, T, C);
+        }
+        else{
+            layernorm_backprop(io[i-1]->res_out2, io[i-1]->dres_out2, io[i]->dln_out1, model->decoder_layer[i]->ln1, dmodel->ddecoder_layer[i]->dln1, io[i]->mean1, io[i]->std1, B, T, C);
+        }
+    }
+    embedding_backprop(f->demb_output, f->input, dmodel->dembedding->dinp_emb, dmodel->dembedding->dpos_emb, B, T, C);
+}
+
+// simple SGD, TODO: Adam optimizer
+void update_params(float *param, float *gradients, size_t param_size, float lr){
+    for(int i = 0; i < param_size; i++){
+        param[i] += -lr * gradients[i];
+    }
+}
+
+void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, struct ip_op *io[], struct foo *f, int total_steps ,int step_no){
+    int B = config->batch_size;
+    int T = config->seq_len;
+    int C = config->d_model;
+    int V = config->vocab_size;
+    int N = config->num_heads;
+    int n = config->n_layers;
+    int warmup_steps = 50;
+    float lr = 1e-4;
+    lr = lr_scheduler(lr, step_no, warmup_steps, total_steps);
+    update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, T*C, lr);
+    update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, V*C, lr);
+    for(int i = 0; i < n; i++){
+        update_params(model->decoder_layer[i]->ln1->ln1_weight, dmodel->ddecoder_layer[i]->dln1->dln1_weight, C, lr);
+        update_params(model->decoder_layer[i]->ln1->ln1_bias, dmodel->ddecoder_layer[i]->dln1->dln1_bias, C, lr);
+        update_params(model->decoder_layer[i]->causal_attention->attn_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_weight, C*3*C, lr);
+        update_params(model->decoder_layer[i]->causal_attention->attn_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_bias, 3*C, lr);
+        update_params(model->decoder_layer[i]->causal_attention->proj_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_weight, C*C, lr);
+        update_params(model->decoder_layer[i]->causal_attention->proj_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_bias, C, lr);
+        update_params(model->decoder_layer[i]->ln2->ln1_weight, dmodel->ddecoder_layer[i]->dln2->dln1_weight, C, lr);
+        update_params(model->decoder_layer[i]->ln2->ln1_bias, dmodel->ddecoder_layer[i]->dln2->dln1_bias, C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_fc_weight, dmodel->ddecoder_layer[i]->dmlp->d_fc_weight, C*4*C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, 4*C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_proj_weight, dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, C*4*C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, C, lr);
+    }
+    update_params(model->lnf->ln1_weight, dmodel->dlnf->dln1_weight, C, lr);
+    update_params(model->lnf->ln1_bias, dmodel->dlnf->dln1_bias, C, lr);
+    update_params(model->final_layer->final_weight, dmodel->dfinal_layer->dfinal_weight, C*V, lr);
+    update_params(model->final_layer->final_bias, dmodel->dfinal_layer->dfinal_bias, V, lr);
 }
 
 // generating random numbers from normal distribution using Box Muller transform
@@ -470,6 +543,45 @@ void xavier_normal_init(float *tensor, int fan_in, int fan_out, int flag) {
     }
 }
 
+void init_gpt(struct gpt *model, int T, int C, int V, int N, int NUM_LAYERS){
+    xavier_normal_init(model->embedding->inp_emb, V, C, 0);
+    xavier_normal_init(model->embedding->pos_emb, T, C, 0);
+    for(int i = 0; i < NUM_LAYERS; i++){
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_weight, C, 3*C, 1);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_bias, 1, 3*C, 1);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_weight, C, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_bias, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_weight, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_bias, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_weight, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_bias, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_weight, C, 4*C, 1);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_bias, 1, 4*C, 1);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_weight, 4*C, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_bias, 1, C, 1);
+    }
+    xavier_normal_init(model->lnf->ln1_weight, 1, C, 0);
+    xavier_normal_init(model->lnf->ln1_bias, 1, C, 0);
+    xavier_normal_init(model->final_layer->final_weight, C, V, 0);
+    xavier_normal_init(model->final_layer->final_bias, 1, V, 0);
+}
+void _zero_grad(struct dGpt *dmodel, size_t dsize){
+    memset(dmodel->dembedding->dinp_emb, 0, dsize);
+}
+void reset_io_foo(struct ip_op *io[], struct foo *f, size_t ip_op_size, size_t foo_size){
+    memset(f->input, 0, foo_size);
+    memset(io[0]->dec_ip, 0, ip_op_size);
+}
+
+void next_batch(int *input, int *tokens, int *targets, int curr_pointer, int B, int T){
+    if(curr_pointer + B * T + 1 >= sizeof(tokens)/sizeof(tokens[0])){
+        curr_pointer = 0;
+    }
+    for(int i = 0; i < B * T; i++){
+        input[i] = tokens[curr_pointer + i];
+        targets[i] = tokens[curr_pointer + i + 1];
+    }
+}
 
 int main() {
     struct Config config = {16, 1024, 8, 768, 50304, 8};
@@ -478,18 +590,42 @@ int main() {
     struct dGpt *dmodel = (struct dGpt *)malloc(sizeof(struct dGpt));
     struct ip_op **io = (struct ip_op **)malloc(NUM_LAYERS * sizeof(struct ip_op *));
     struct foo *f = (struct foo *)malloc(sizeof(struct foo));
+    size_t gpt_size = calculate_total_gpt_size(B, T, C, V);
+    size_t dgpt_size = calculate_total_dgpt_size(T, C, V);
+    size_t ip_op_size = calculate_ip_op_size(B, T, C, NUM_LAYERS, N);
+    size_t foo_size = calculate_foo_size(B, T, C);
     map_gpt(model, "gpt.bin", B, T, C, V);
-    map_dgpt(dmodel, "dgpt_model.dat", T, C, V);
+    map_dgpt(dmodel, "dgpt_model.bin", T, C, V);
     map_ip_op_array(io, "ip_op.bin", B, T, C, NUM_LAYERS, N);
     map_foo(f, "foo.bin", B, T, C);
-    clock_t start_time = clock();
-    gpt_forward(config, model, io, f);
-    clock_t end_time = clock();
-    double elapsed_time = (double)(end_time - start_time) * 1000.0 / CLOCKS_PER_SEC;
-    printf("Execution time: %.2f milliseconds\n", elapsed_time);
-    int i = 6;
-    
+    init_gpt(model, T, C, V, N, NUM_LAYERS);
+    _zero_grad(dmodel, dgpt_size);
+    reset_io_foo(io, f, ip_op_size, foo_size);
 
-    printf("%f", (f->emb_output[16*1024*768]));
+    // we'll use tokens generated from a python script, TODO : build tokenizer in C
+    int total_batch = B * T;
+    int curr_pointer = 0;
+    int total_file_size;
+    //reading tokens from a file
+    int tokens[total_file_size];
+    FILE *fp = fopen("output.txt", "r");
+    for(int i = 0; i < total_file_size; i++){
+        fscanf(fp, "%d", &tokens[i]);
+    }
+
+    // training loop
+    int steps = 10;
+    for(int i = 0; i < steps; i++){
+        int *targets = (int *)calloc(B * T, sizeof(int));
+        next_batch(f->input, tokens, targets, curr_pointer, B, T);
+        gpt_forward(&config, model, io, f);
+        float loss = CrossEntropy(f->fl_output, f->input, B, T, V);
+        printf("Loss: %f\n", loss);
+        _zero_grad(dmodel, dgpt_size);
+        loss_backward(f->fl_output, targets, f->dfl_output, B, T, V);
+        gpt_backward(&config, model, dmodel, io, f);
+        gpt_step(&config, model, dmodel, io, f, steps, i);
+    }
+
     return 0;
 }
