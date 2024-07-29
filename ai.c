@@ -23,11 +23,13 @@ struct Config
 };
 
 void ResidualLayer(float *input1, float *input2, float *output, int size) {
+    printf("hi from residual\n");
     for (int i = 0; i < size; i++) {
         output[i] = input1[i] + input2[i];
     }
 }
 void residual_backprop(float *dinput1, float *dinput2, float *doutput, int size) {
+    printf("hi from rresidual bakcprop\n");
     for (int i = 0; i < size; i++) {
         dinput1[i] += doutput[i];
         dinput2[i] += doutput[i];
@@ -45,6 +47,7 @@ float lr_scheduler(float lr, int step, int warmup_steps, int total_steps) {
 // GELU(x)=0.5*x*(1+Tanh(sqrt(2/π) * (x+0.044715*x^3))) tanh approximation refered from https://arxiv.org/pdf/1606.08415.pdf
 void GELU(float *input, float *output, int size)
 {
+    printf("hi from gelu\n");
     for (int i = 0; i < size; i++) {
         float x = input[i];
         output[i] = const1 * x * (1 + tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x)));
@@ -52,6 +55,7 @@ void GELU(float *input, float *output, int size)
 }
 
 void gelu_backprop(float *input, float *dinput, float *doutput, int size) {
+    printf("hi from gelu backprop\n");
     for (int i = 0; i < size; i++) {
         float x = input[i];
         float tanh_x = tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x));
@@ -89,6 +93,7 @@ void matmul(const float *inp, const float *weight, float *bias, float *out, int 
 // bad naming of vars but dout is actually the gradient coming into the block not going 'out' of the block
 void matmul_backprop(const float *inp, const float *weight, const float *dout, float *din, float *dweight, float *dbias, int m, int k, int n, int B)
 {
+    printf("matmul backprop\n");
     #pragma omp parallel for collapse(2)
     for (int i = 0; i < B; i++)
     {
@@ -116,6 +121,7 @@ void matmul_backprop(const float *inp, const float *weight, const float *dout, f
 
 void embeddings_layer(const int *inp, const float *inp_emb, const float *pos_emb, float *out, int B, int T, int C)
 {
+    printf("hi frome emb\n");
     for (int i = 0; i < B; i++)
     {
         for (int j = 0; j < T; j++)
@@ -129,6 +135,7 @@ void embeddings_layer(const int *inp, const float *inp_emb, const float *pos_emb
 }
 void embedding_backprop(const float *doutput, const int *inp, float *dinp_emb, float *dpos_emb, int B, int T, int C)
 {
+    printf("hi from emb backprop\n");
     for (int i = 0; i < B; i++)
     {
         for (int j = 0; j < T; j++)
@@ -143,6 +150,7 @@ void embedding_backprop(const float *doutput, const int *inp, float *dinp_emb, f
 }
 void layernorm(float *input, float *output, float *mean, struct LayerNorm *ln, float *std, int B, int T, int C, int train)
 {
+    printf("hi from layernorm\n");
     float epsilon = 1e-5;
     if (train == 1) {
         float c = C;
@@ -191,6 +199,7 @@ void layernorm(float *input, float *output, float *mean, struct LayerNorm *ln, f
 // var2 = sum(dout * ln_weight dim = -1)/c*std ---> over C
 // var3 = (x - mean) * sum(dout * ln_weight * (x - mean), dim = -1)/c*std^3 ---> over C
 void layernorm_backprop(float *input, float *dinput, float *doutput, struct LayerNorm *ln, struct dLayerNorm *dln, const float *mean, const float *std, int B, int T, int C) {
+    printf("hi from ln backprop\n");
     for (int i = 0; i < B * T; i++) {
         float var2 = 0.0f;
         float var3 = 0.0f;
@@ -219,6 +228,7 @@ void layernorm_backprop(float *input, float *dinput, float *doutput, struct Laye
 void multilayer_perceptron(float *input, float *output1, float *output2, float *gelu_out1, float *gelu_out2, struct MLP *mlp, int B, int T, int C)
 {
     // b, t, c = b, t, 4c
+    printf("Hi from mlp\n");
     matmul(input, mlp->c_fc_weight, mlp->c_fc_bias, output1, T, C, 4 * C, B);// output of first layer is with gelu input
     GELU(output1, gelu_out1, B * T * 4 * C);
     //b, t, 4c = b, t, c
@@ -227,6 +237,7 @@ void multilayer_perceptron(float *input, float *output1, float *output2, float *
 }
 
 void mlp_backprop(float *input, float *dinput, struct ip_op *io, struct MLP *mlp, struct dMlp *dmlp, int B, int T, int C) {
+    printf("Hi from mlp backprop\n");
     gelu_backprop(io->mlp_l2_out, io->dmlp_l2_out, io->dgelu_out2, B * T * C);
     matmul_backprop(io->gelu_out1, mlp->c_proj_weight, io->dmlp_l2_out, io->dgelu_out1, dmlp->d_proj_weight, dmlp->d_proj_bias, T, 4 * C, C, B);
     gelu_backprop(io->mlp_l1_out, io->dmlp_l1_out, io->dgelu_out1, B * T * 4 * C);
@@ -237,6 +248,7 @@ void mlp_backprop(float *input, float *dinput, struct ip_op *io, struct MLP *mlp
 void CausalAttention(float *input, float *output, struct AttentionBlock *attn, struct ip_op *io, int B, int T, int C, int num_heads)
 {
     assert(C % num_heads == 0);
+    printf("Hi from Attention\n");
     int head_size = C / num_heads;
     int N = num_heads;
     // --------- Stage 1-----------
@@ -300,6 +312,7 @@ void CausalAttention(float *input, float *output, struct AttentionBlock *attn, s
 void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlock *dAtt, struct ip_op *io, int B, int T, int C, int num_heads) {
 
     float *dattn = (float *)calloc(B * T * C, sizeof(float));
+    printf("hi from attention backprop\n");
     int N = num_heads;
     int H = C / N;
     // stage 3
@@ -352,51 +365,77 @@ void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlo
 }
 
 // Softmax = log(exp(logits)/sum(exp(logits))) = logits - log(sum(exp(logits)))
-void Softmax(float *logits, float *out, int B, int T, int C)
-{
-    for (int i = 0; i < B * T; i++)
-    {
-        float maxi = -INFINITY; // numerical stability
-        for (int j = 0; j < C; j++)
-        {
-            maxi = fmax(maxi, logits[i * C + j]);
-        }
-        float sum = 0.0f;
-        for (int j = 0; j < C; j++)
-        {
-            sum += exp(logits[i * C + j] - maxi);
-        }
-        for (int j = 0; j < C; j++)
-        {
-            out[i * C + j] = logits[i * C + j] - maxi - log(sum);
+void Softmax(float *logits, float *probs, int B, int T, int V) {
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            float max_logit = logits[b * T * V + t * V];
+            for (int v = 1; v < V; v++) {
+                if (logits[b * T * V + t * V + v] > max_logit) {
+                    max_logit = logits[b * T * V + t * V + v];
+                }
+            }
+
+            float sum_exp = 0.0f;
+            for (int v = 0; v < V; v++) {
+                probs[b * T * V + t * V + v] = expf(logits[b * T * V + t * V + v] - max_logit);
+                sum_exp += probs[b * T * V + t * V + v];
+            }
+
+            for (int v = 0; v < V; v++) {
+                probs[b * T * V + t * V + v] /= sum_exp;
+            }
         }
     }
 }
 
-float CrossEntropy(float *logits, int *targets, int B, int T, int C)
-{
+float CrossEntropy(float *logits, int *targets, int B, int T, int V) {
     float loss = 0.0f;
-    float *probs = (float *)calloc(B * T, sizeof(float));
-    Softmax(logits, probs, B, T, C);
-    for (int i = 0; i < B * T; i++)
-    {
-        loss -= probs[i * C + targets[i]];
+    float *probs = (float *)calloc(B * T * V, sizeof(float));
+    if (probs == NULL) {
+        perror("Failed to allocate memory");
+        return -1.0f;
     }
+
+    Softmax(logits, probs, B, T, V);
+
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            int target = targets[b * T + t];
+            float prob = probs[b * T * V + t * V + target];
+            loss -= logf(prob);
+        }
+    }
+
     free(probs);
     return loss / (B * T);
 }
 
+void loss_backward(float *logits, int *targets, float *dlogits, int B, int T, int C) {
+    float *probs = (float *)malloc(B * T * C * sizeof(float));
+    if (probs == NULL) {
+        perror("Failed to allocate memory for softmax outputs");
+        return;
+    }
 
-void loss_backward(float *logits, int *targets, float *dlogits, int B, int T, int C)
-{
-    Softmax(logits, dlogits, B, T, C);
-    for (int i = 0; i < B * T; i++)
-    {
-        for(int j = 0; j < C; j++){
-            dlogits[i * C + j] -= targets[i] == j ? 1.0f : 0.0f;
-            dlogits[i * C + j] /= B * T;
+    // Compute softmax of logits
+    Softmax(logits, probs, B, T, C);
+
+    // Compute the gradient of the loss with respect to logits
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            int target = targets[b * T + t];
+            for (int c = 0; c < C; c++) {
+                int index = b * T * C + t * C + c;
+                dlogits[index] = probs[index] - (c == target ? 1.0f : 0.0f);
+            }
         }
     }
+    // Normalize the gradient by the number of samples
+    float norm_factor = 1.0f / (B * T);
+    for (int i = 0; i < B * T * C; i++) {
+        dlogits[i] *= norm_factor;
+    }
+    free(probs);
 }
 
 void gpt_forward(struct Config *config, struct gpt *model, struct ip_op *io[], struct foo *f){
@@ -406,6 +445,7 @@ void gpt_forward(struct Config *config, struct gpt *model, struct ip_op *io[], s
     int N = config->num_heads;
     int n = config->n_layers;
     // embeddings layer
+    printf("Forward prop starting....\n");
     embeddings_layer(f->input, model->embedding->inp_emb, model->embedding->pos_emb, f->emb_output, B, T, C);
     // decoder layers
     for(int i = 0; i < n; i++){
@@ -455,7 +495,7 @@ void gpt_backward(struct Config *config, struct gpt *model, struct dGpt *dmodel,
         else{
             residual_backprop(io[i]->datt_out, io[i-1]->dres_out2, io[i]->dres_out1, B*T*C);
         }
-        causal_attention_backprop(model->decoder_layer[i]->causal_attention, dmodel->ddecoder_layer[i]->dcausal_attention, io, B, T, C, N);
+        causal_attention_backprop(model->decoder_layer[i]->causal_attention, dmodel->ddecoder_layer[i]->dcausal_attention, io[i], B, T, C, N);
 
         if(i == 0){
             layernorm_backprop(f->emb_output, f->demb_output, io[i]->dln_out1, model->decoder_layer[i]->ln1, dmodel->ddecoder_layer[i]->dln1, io[i]->mean1, io[i]->std1, B, T, C);
@@ -483,6 +523,7 @@ void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, str
     int n = config->n_layers;
     int warmup_steps = 50;
     float lr = 1e-4;
+    printf("gpt step\n");
     lr = lr_scheduler(lr, step_no, warmup_steps, total_steps);
     update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, T*C, lr);
     update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, V*C, lr);
@@ -564,8 +605,10 @@ void init_gpt(struct gpt *model, int T, int C, int V, int N, int NUM_LAYERS){
     xavier_normal_init(model->lnf->ln1_bias, 1, C, 0);
     xavier_normal_init(model->final_layer->final_weight, C, V, 0);
     xavier_normal_init(model->final_layer->final_bias, 1, V, 0);
+    printf("GPT initialized\n");
 }
 void _zero_grad(struct dGpt *dmodel, size_t dsize){
+    printf("Grads reset\n");
     memset(dmodel->dembedding->dinp_emb, 0, dsize);
 }
 void reset_io_foo(struct ip_op *io[], struct foo *f, size_t ip_op_size, size_t foo_size){
@@ -581,7 +624,62 @@ void next_batch(int *input, int *tokens, int *targets, int curr_pointer, int B, 
         input[i] = tokens[curr_pointer + i];
         targets[i] = tokens[curr_pointer + i + 1];
     }
+    printf("next batch gen successfully\n");
 }
+int* read_tokens_from_file(const char *filename, int *num_indices) {
+    FILE *file = fopen(filename, "r");
+    if (file == NULL) {
+        perror("Failed to open file");
+        return NULL;
+    }
+
+    // file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    char *buffer = (char *)malloc(file_size + 1);
+    if (buffer == NULL) {
+        perror("Failed to allocate memory");
+        fclose(file);
+        return NULL;
+    }
+
+    fread(buffer, 1, file_size, file);
+    buffer[file_size] = '\0';
+
+    fclose(file);
+
+    
+    int estimated_size = file_size / 2;
+    int *indices = (int *)malloc(estimated_size * sizeof(int));
+    if (indices == NULL) {
+        perror("Failed to allocate memory for indices");
+        free(buffer);
+        return NULL;
+    }
+
+    int index_count = 0;
+    char *token = strtok(buffer, ", \n");
+    while (token != NULL) {
+        if (index_count >= estimated_size) {
+            estimated_size *= 2;
+            indices = (int *)realloc(indices, estimated_size * sizeof(int));
+            if (indices == NULL) {
+                perror("Failed to reallocate memory for indices");
+                free(buffer);
+                return NULL;
+            }
+        }
+        indices[index_count++] = atoi(token);
+        token = strtok(NULL, ", \n");
+    }
+
+    free(buffer);
+    *num_indices = index_count;
+    return indices;
+}
+
 
 int main() {
     struct Config config = {16, 1024, 8, 768, 50304, 8};
@@ -605,14 +703,13 @@ int main() {
     // we'll use tokens generated from a python script, TODO : build tokenizer in C
     int total_batch = B * T;
     int curr_pointer = 0;
-    int total_file_size;
+    
     //reading tokens from a file
-    int tokens[total_file_size];
-    FILE *fp = fopen("output.txt", "r");
-    for(int i = 0; i < total_file_size; i++){
-        fscanf(fp, "%d", &tokens[i]);
-    }
-
+    int num_indices = 0;
+    int* tokens = read_tokens_from_file("output.txt", &num_indices);
+    int *targets = (int *)calloc(B * T, sizeof(int));
+    next_batch(f->input, tokens, targets, curr_pointer, B, T);
+    printf("%d", targets[10]);
     // training loop
     int steps = 10;
     for(int i = 0; i < steps; i++){
@@ -625,6 +722,7 @@ int main() {
         loss_backward(f->fl_output, targets, f->dfl_output, B, T, V);
         gpt_backward(&config, model, dmodel, io, f);
         gpt_step(&config, model, dmodel, io, f, steps, i);
+        reset_io_foo(io, f, ip_op_size, foo_size);
     }
 
     return 0;
