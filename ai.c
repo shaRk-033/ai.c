@@ -35,11 +35,13 @@ void residual_backprop(float *dinput1, float *dinput2, float *doutput, int size)
 }
 
 // Cosine learning rate scheduler
-float lr_scheduler(float lr, int step, int warmup_steps, int total_steps) {
+float lr_scheduler(float base_lr, int step, int warmup_steps, int total_steps) {
     if (step < warmup_steps) {
-        return lr * (step / warmup_steps);
+        return base_lr * ((float)step / warmup_steps);
+    } else {
+        float progress = (float)(step - warmup_steps) / (total_steps - warmup_steps);
+        return base_lr * (0.5f * (1.0f + cosf(M_PI * progress)));
     }
-    return 0.5 * lr * (1 + cos((step - warmup_steps) / (total_steps - warmup_steps) * M_PI));
 }
 
 // GELU(x)=0.5*x*(1+Tanh(sqrt(2/π) * (x+0.044715*x^3))) tanh approximation refered from https://arxiv.org/pdf/1606.08415.pdf
@@ -367,19 +369,19 @@ void Softmax(float *logits, float *out, int B, int T, int C)
 {
     for (int i = 0; i < B * T; i++)
     {
-        float maxi = -INFINITY;
+        float max_logit = -INFINITY;
         for (int j = 0; j < C; j++)
         {
-            maxi = fmaxf(maxi, logits[i * C + j]);
+            max_logit = fmaxf(max_logit, logits[i * C + j]);
         }
         float sum = 0.0f;
         for (int j = 0; j < C; j++)
         {
-            sum += expf(logits[i * C + j] - maxi);
+            sum += expf(logits[i * C + j] - max_logit);
         }
         for (int j = 0; j < C; j++)
         {
-            out[i * C + j] = expf(logits[i * C + j] - maxi) / (sum + 1e-9f);
+            out[i * C + j] = expf(logits[i * C + j] - max_logit) / (sum + 1e-9f);
         }
     }
 }
@@ -391,7 +393,17 @@ float CrossEntropy(float *logits, int *targets, int B, int T, int C)
     {
         int target = targets[i];
         if (target >= 0 && target < C) {
-            loss -= logf(fmaxf(logits[i * C + target], 1e-9f));
+            float max_logit = -INFINITY;
+            for (int j = 0; j < C; j++) {
+                if (logits[i * C + j] > max_logit) {
+                    max_logit = logits[i * C + j];
+                }
+            }
+            float sum_exp = 0.0f;
+            for (int j = 0; j < C; j++) {
+                sum_exp += expf(logits[i * C + j] - max_logit);
+            }
+            loss -= (logits[i * C + target] - max_logit - logf(sum_exp));
         }
     }
     return loss / (B * T);
@@ -483,6 +495,117 @@ void update_params(float *param, float *gradients, size_t param_size, float lr){
     }
 }
 
+void clip_gradients(struct dGpt *dmodel, float max_norm, int B, int T, int C, int V, int NUM_LAYERS) {
+    float total_norm = 0.0f;
+    // Calculate the total norm of all gradients
+    // Embedding gradients
+    for (int i = 0; i < V * C; i++) {
+        total_norm += dmodel->dembedding->dinp_emb[i] * dmodel->dembedding->dinp_emb[i];
+    }
+    for (int i = 0; i < T * C; i++) {
+        total_norm += dmodel->dembedding->dpos_emb[i] * dmodel->dembedding->dpos_emb[i];
+    }
+    // Decoder layer gradients
+    for (int l = 0; l < NUM_LAYERS; l++) {
+        // Add norms for all gradients in the decoder layer
+        for (int i = 0; i < C * 3 * C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dcausal_attention->dattn_weight[i] * dmodel->ddecoder_layer[l]->dcausal_attention->dattn_weight[i];
+        }
+        for (int i = 0; i < 3 * C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dcausal_attention->dattn_bias[i] * dmodel->ddecoder_layer[l]->dcausal_attention->dattn_bias[i];
+        }
+        for (int i = 0; i < C * C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dcausal_attention->dproj_weight[i] * dmodel->ddecoder_layer[l]->dcausal_attention->dproj_weight[i];
+        }
+        for (int i = 0; i < C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dcausal_attention->dproj_bias[i] * dmodel->ddecoder_layer[l]->dcausal_attention->dproj_bias[i];
+        }
+        for (int i = 0; i < C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dln1->dln1_weight[i] * dmodel->ddecoder_layer[l]->dln1->dln1_weight[i];
+            total_norm += dmodel->ddecoder_layer[l]->dln1->dln1_bias[i] * dmodel->ddecoder_layer[l]->dln1->dln1_bias[i];
+            total_norm += dmodel->ddecoder_layer[l]->dln2->dln1_weight[i] * dmodel->ddecoder_layer[l]->dln2->dln1_weight[i];
+            total_norm += dmodel->ddecoder_layer[l]->dln2->dln1_bias[i] * dmodel->ddecoder_layer[l]->dln2->dln1_bias[i];
+        }
+        for (int i = 0; i < C * (4 * C); i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dmlp->d_fc_weight[i] * dmodel->ddecoder_layer[l]->dmlp->d_fc_weight[i];
+            total_norm += dmodel->ddecoder_layer[l]->dmlp->d_proj_weight[i] * dmodel->ddecoder_layer[l]->dmlp->d_proj_weight[i];
+        }
+        for (int i = 0; i < 4 * C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dmlp->d_fc_bias[i] * dmodel->ddecoder_layer[l]->dmlp->d_fc_bias[i];
+        }
+        for (int i = 0; i < C; i++) {
+            total_norm += dmodel->ddecoder_layer[l]->dmlp->d_proj_bias[i] * dmodel->ddecoder_layer[l]->dmlp->d_proj_bias[i];
+        }
+    }
+    // Final layer gradients
+    for (int i = 0; i < C * V; i++) {
+        total_norm += dmodel->dfinal_layer->dfinal_weight[i] * dmodel->dfinal_layer->dfinal_weight[i];
+    }
+    for (int i = 0; i < V; i++) {
+        total_norm += dmodel->dfinal_layer->dfinal_bias[i] * dmodel->dfinal_layer->dfinal_bias[i];
+    }
+    
+    total_norm = sqrt(total_norm);
+    
+    if (total_norm > max_norm) {
+        float scale = max_norm / total_norm;
+        // Scale all gradients
+        // Embedding gradients
+        for (int i = 0; i < V * C; i++) {
+            dmodel->dembedding->dinp_emb[i] *= scale;
+        }
+        for (int i = 0; i < T * C; i++) {
+            dmodel->dembedding->dpos_emb[i] *= scale;
+        }
+        // Decoder layer gradients
+        for (int l = 0; l < NUM_LAYERS; l++) {
+            for (int i = 0; i < C * 3 * C; i++) {
+                dmodel->ddecoder_layer[l]->dcausal_attention->dattn_weight[i] *= scale;
+            }
+            for (int i = 0; i < 3 * C; i++) {
+                dmodel->ddecoder_layer[l]->dcausal_attention->dattn_bias[i] *= scale;
+            }
+            for (int i = 0; i < C * C; i++) {
+                dmodel->ddecoder_layer[l]->dcausal_attention->dproj_weight[i] *= scale;
+            }
+            for (int i = 0; i < C; i++) {
+                dmodel->ddecoder_layer[l]->dcausal_attention->dproj_bias[i] *= scale;
+            }
+            for (int i = 0; i < C; i++) {
+                dmodel->ddecoder_layer[l]->dln1->dln1_weight[i] *= scale;
+                dmodel->ddecoder_layer[l]->dln1->dln1_bias[i] *= scale;
+                dmodel->ddecoder_layer[l]->dln2->dln1_weight[i] *= scale;
+                dmodel->ddecoder_layer[l]->dln2->dln1_bias[i] *= scale;
+            }
+            for (int i = 0; i < C * (4 * C); i++) {
+                dmodel->ddecoder_layer[l]->dmlp->d_fc_weight[i] *= scale;
+                dmodel->ddecoder_layer[l]->dmlp->d_proj_weight[i] *= scale;
+            }
+            for (int i = 0; i < 4 * C; i++) {
+                dmodel->ddecoder_layer[l]->dmlp->d_fc_bias[i] *= scale;
+            }
+            for (int i = 0; i < C; i++) {
+                dmodel->ddecoder_layer[l]->dmlp->d_proj_bias[i] *= scale;
+            }
+        }
+        // Final layer gradients
+        for (int i = 0; i < C * V; i++) {
+            dmodel->dfinal_layer->dfinal_weight[i] *= scale;
+        }
+        for (int i = 0; i < V; i++) {
+            dmodel->dfinal_layer->dfinal_bias[i] *= scale;
+        }
+    }
+}
+void update_grad_stats(float *grad, int size, float *max_grad, float *avg_grad, int *grad_count) {
+    for (int i = 0; i < size; i++) {
+        float abs_grad = fabsf(grad[i]);
+        *max_grad = fmaxf(*max_grad, abs_grad);
+        *avg_grad += abs_grad;
+        (*grad_count)++;
+    }
+}
+
 void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, struct ip_op *io[], struct foo *f, int total_steps ,int step_no){
     int B = config->batch_size;
     int T = config->seq_len;
@@ -490,11 +613,75 @@ void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, str
     int V = config->vocab_size;
     int N = config->num_heads;
     int n = config->n_layers;
-    int warmup_steps = 50;
-    float lr = 1e-2;
-    lr = lr_scheduler(lr, step_no, warmup_steps, total_steps);
-    update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, T*C, lr);
-    update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, V*C, lr);
+    int warmup_steps = 100;  // Reduced warmup steps
+    float base_lr = 1e-3;  // Increased base learning rate
+    float lr = lr_scheduler(base_lr, step_no, warmup_steps, total_steps);
+    
+    // Clip gradients
+    clip_gradients(dmodel, 1.0, B, T, C, V, n);  // Max norm of 1.0
+    
+    // Log training progress
+    if (step_no % 10 == 0) {
+        printf("Step %d: LR = %e\n", step_no, lr);
+        // Log gradient statistics
+        float max_grad = 0.0f, avg_grad = 0.0f;
+        int grad_count = 0;
+
+        // Embedding gradients
+        update_grad_stats(dmodel->dembedding->dinp_emb, V * C, &max_grad, &avg_grad, &grad_count);
+        update_grad_stats(dmodel->dembedding->dpos_emb, T * C, &max_grad, &avg_grad, &grad_count);
+
+        // Decoder layer gradients
+        for (int i = 0; i < n; i++) {
+            update_grad_stats(dmodel->ddecoder_layer[i]->dln1->dln1_weight, C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dln1->dln1_bias, C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dcausal_attention->dattn_weight, C * 3 * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dcausal_attention->dattn_bias, 3 * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dcausal_attention->dproj_weight, C * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dcausal_attention->dproj_bias, C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dln2->dln1_weight, C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dln2->dln1_bias, C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dmlp->d_fc_weight, C * 4 * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, 4 * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, 4 * C * C, &max_grad, &avg_grad, &grad_count);
+            update_grad_stats(dmodel->ddecoder_layer[i]->dmlp->d_proj_bias, C, &max_grad, &avg_grad, &grad_count);
+        }
+
+        // Final layer norm gradients
+        update_grad_stats(dmodel->dlnf->dln1_weight, C, &max_grad, &avg_grad, &grad_count);
+        update_grad_stats(dmodel->dlnf->dln1_bias, C, &max_grad, &avg_grad, &grad_count);
+
+        // Final layer gradients
+        update_grad_stats(dmodel->dfinal_layer->dfinal_weight, C * V, &max_grad, &avg_grad, &grad_count);
+        update_grad_stats(dmodel->dfinal_layer->dfinal_bias, V, &max_grad, &avg_grad, &grad_count);
+
+        if (grad_count > 0) {
+            avg_grad /= grad_count;
+        }
+        printf("Max gradient: %e, Avg gradient: %e\n", max_grad, avg_grad);
+        
+        // Log some predictions
+        printf("Sample predictions:\n");
+        for (int i = 0; i < 5; i++) {
+            int idx = rand() % (B * T);
+            int target = f->input[idx];
+            int pred = 0;
+            float max_prob = -INFINITY;
+            for (int j = 0; j < V; j++) {
+                if (f->fl_output[idx * V + j] > max_prob) {
+                    max_prob = f->fl_output[idx * V + j];
+                    pred = j;
+                }
+            }
+            printf("  Target: %d, Prediction: %d, Confidence: %f\n", target, pred, max_prob);
+        }
+    }
+
+    
+    // Update parameters
+    update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, V*C, lr);
+    update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, T*C, lr);
+    
     for(int i = 0; i < n; i++){
         update_params(model->decoder_layer[i]->ln1->ln1_weight, dmodel->ddecoder_layer[i]->dln1->dln1_weight, C, lr);
         update_params(model->decoder_layer[i]->ln1->ln1_bias, dmodel->ddecoder_layer[i]->dln1->dln1_bias, C, lr);
@@ -506,8 +693,8 @@ void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, str
         update_params(model->decoder_layer[i]->ln2->ln1_bias, dmodel->ddecoder_layer[i]->dln2->dln1_bias, C, lr);
         update_params(model->decoder_layer[i]->mlp->c_fc_weight, dmodel->ddecoder_layer[i]->dmlp->d_fc_weight, C*4*C, lr);
         update_params(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, 4*C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_proj_weight, dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, C*4*C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_proj_weight, dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, 4*C*C, lr);
+        update_params(model->decoder_layer[i]->mlp->c_proj_bias, dmodel->ddecoder_layer[i]->dmlp->d_proj_bias, C, lr);
     }
     update_params(model->lnf->ln1_weight, dmodel->dlnf->dln1_weight, C, lr);
     update_params(model->lnf->ln1_bias, dmodel->dlnf->dln1_bias, C, lr);
@@ -540,8 +727,8 @@ float randn(float mean, float stddev) {
     return (mean + y1 * stddev);
 }
 
-void xavier_normal_init(float *tensor, int fan_in, int fan_out, int flag) {
-    float stddev = sqrt(2.0 / (fan_in + fan_out));
+void xavier_normal_init(float *tensor, int fan_in, int fan_out, int flag, float init_scale) {
+    float stddev = sqrt(2.0 / (fan_in + fan_out)) * init_scale;
     float x = 1 / sqrt(2.0 * 8); // Adjusted handling for residual connections variance
     for (int i = 0; i < fan_in * fan_out; i++) {
         if (flag == 1) {
@@ -553,26 +740,27 @@ void xavier_normal_init(float *tensor, int fan_in, int fan_out, int flag) {
 }
 
 void init_gpt(struct gpt *model, int T, int C, int V, int N, int NUM_LAYERS){
-    xavier_normal_init(model->embedding->inp_emb, V, C, 0);
-    xavier_normal_init(model->embedding->pos_emb, T, C, 0);
+    float init_scale = 0.02f;  // Reduced initial scale
+    xavier_normal_init(model->embedding->inp_emb, V, C, 0, init_scale);
+    xavier_normal_init(model->embedding->pos_emb, T, C, 0, init_scale);
     for(int i = 0; i < NUM_LAYERS; i++){
-        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_weight, C, 3*C, 1);
-        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_bias, 1, 3*C, 1);
-        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_weight, C, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_bias, 1, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_weight, 1, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_bias, 1, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_weight, 1, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_bias, 1, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_weight, C, 4*C, 1);
-        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_bias, 1, 4*C, 1);
-        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_weight, 4*C, C, 1);
-        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_bias, 1, C, 1);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_weight, C, 3*C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->attn_bias, 1, 3*C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_weight, C, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->causal_attention->proj_bias, 1, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_weight, 1, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->ln1->ln1_bias, 1, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_weight, 1, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->ln2->ln1_bias, 1, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_weight, C, 4*C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_fc_bias, 1, 4*C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_weight, 4*C, C, 1, init_scale);
+        xavier_normal_init(model->decoder_layer[i]->mlp->c_proj_bias, 1, C, 1, init_scale);
     }
-    xavier_normal_init(model->lnf->ln1_weight, 1, C, 0);
-    xavier_normal_init(model->lnf->ln1_bias, 1, C, 0);
-    xavier_normal_init(model->final_layer->final_weight, C, V, 0);
-    xavier_normal_init(model->final_layer->final_bias, 1, V, 0);
+    xavier_normal_init(model->lnf->ln1_weight, 1, C, 0, init_scale);
+    xavier_normal_init(model->lnf->ln1_bias, 1, C, 0, init_scale);
+    xavier_normal_init(model->final_layer->final_weight, C, V, 0, init_scale);
+    xavier_normal_init(model->final_layer->final_bias, 1, V, 0, init_scale);
     printf("GPT initialized\n");
 }
 void _zero_grad(struct dGpt *dmodel, size_t dsize){
@@ -683,12 +871,20 @@ int main() {
         curr_pointer+=total_batch;
         gpt_forward(&config, model, io, f);
         float loss = CrossEntropy(f->fl_output, f->input, B, T, V);
-        printf("Loss: %f\n", loss);
+        
+        if (isnan(loss)) {
+            printf("NaN loss detected at step %d. Stopping training.\n", i);
+            break;
+        }
+        
+        printf("Step %d, Loss: %f\n", i, loss);
         _zero_grad(dmodel, dgpt_size);
         loss_backward(f->fl_output, targets, f->dfl_output, B, T, V);
         gpt_backward(&config, model, dmodel, io, f);
         gpt_step(&config, model, dmodel, io, f, steps, i);
         reset_io_foo(io, f, ip_op_size, foo_size);
+        
+        free(targets);
     }
 
     return 0;
