@@ -37,9 +37,9 @@ void residual_backprop(float *dinput1, float *dinput2, float *doutput, int size)
 // Cosine learning rate scheduler
 float lr_scheduler(float lr, int step, int warmup_steps, int total_steps) {
     if (step < warmup_steps) {
-        return lr * ((float)step / warmup_steps);
+        return lr * (step / warmup_steps);
     }
-    return 0.5f * lr * (1.0f + cosf((float)(step - warmup_steps) / (float)(total_steps - warmup_steps) * M_PI));
+    return 0.5 * lr * (1 + cos((step - warmup_steps) / (total_steps - warmup_steps) * M_PI));
 }
 
 // GELU(x)=0.5*x*(1+Tanh(sqrt(2/π) * (x+0.044715*x^3))) tanh approximation refered from https://arxiv.org/pdf/1606.08415.pdf
@@ -47,40 +47,46 @@ void GELU(float *input, float *output, int size)
 {
     for (int i = 0; i < size; i++) {
         float x = input[i];
-        output[i] = const1 * x * (1.0f + tanhf(SQRT_2_OVER_PI * (x + const2 * x * x * x)));
+        output[i] = const1 * x * (1 + tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x)));
     }
 }
 
 void gelu_backprop(float *input, float *dinput, float *doutput, int size) {
     for (int i = 0; i < size; i++) {
         float x = input[i];
-        float tanh_x = tanhf(SQRT_2_OVER_PI * (x + const2 * x * x * x));
-        float cdf = 0.5f * (1.0f + tanh_x);
-        float pdf = 0.5f * (1.0f - tanh_x * tanh_x) * SQRT_2_OVER_PI * (1.0f + 3.0f * const2 * x * x);
-        dinput[i] += doutput[i] * (cdf + x * pdf);
+        float tanh_x = tanh(SQRT_2_OVER_PI * (x + const2 * x * x * x));
+        float cdf = 0.5 * (1 + tanh_x) + 0.5 * x * (1 - tanh_x * tanh_x) * SQRT_2_OVER_PI * (1 + 3 * const2 * x * x);
+        dinput[i] = cdf * doutput[i];
     }
 }
 
 void matmul(const float *inp, const float *weight, float *bias, float *out, int m, int k, int n, int B)
 {
+
     #pragma omp parallel for collapse(2)
     for (int batch = 0; batch < B; batch++)
     {
         for (int i = 0; i < m; i++)
         {
             int b_i = batch * m * n + i * n;
-            for (int j = 0; j < n; j++)
+            for (int l = 0; l < k; l++)
             {
-                out[b_i + j] = bias == NULL ? 0.0f : bias[j];
-                for (int l = 0; l < k; l++)
+                for (int j = 0; j < n; j++)
                 {
+                    if (l == 0)
+                    {
+                        out[b_i + j] = bias == NULL ? 0.0f : bias[j];
+                    }
                     out[b_i + j] += inp[batch * m * k + i * k + l] * weight[l * n + j];
                 }
             }
         }
     }
 }
-
+// out = inp @ weight + bias--> dinp = dout @ (weight).T
+// dweight = (dinp).T @ dout, dbias = dout.sum()
+// Transposing and matrix mul gets lil bit hairy, i tried on a napkin first
+// bad naming of vars but dout is actually the gradient coming into the block not going 'out' of the block
 void matmul_backprop(const float *inp, const float *weight, const float *dout, float *din, float *dweight, float *dbias, int m, int k, int n, int B)
 {
     #pragma omp parallel for collapse(2)
@@ -90,15 +96,17 @@ void matmul_backprop(const float *inp, const float *weight, const float *dout, f
         {
             for (int l = 0; l < n; l++)
             {
-                if (dbias != NULL) {
-                    #pragma omp atomic
-                    dbias[l] += dout[i * m * n + j * n + l];
-                }
                 for (int x = 0; x < k; x++)
                 {
-                    #pragma omp atomic
+                    if (x == 0)
+                    {
+                        dbias[l] += dout[i * m * n + j * n + l];
+                    }
                     din[i * m * k + j * k + x] += dout[i * m * n + j * n + l] * weight[x * n + l];
-                    #pragma omp atomic
+                }
+            }
+            for (int x = 0; x < k; x++) {
+                for (int l = 0; l < n; l++) {
                     dweight[x * n + l] += inp[i * m * k + j * k + x] * dout[i * m * n + j * n + l];
                 }
             }
@@ -191,25 +199,27 @@ void layernorm(float *input, float *output, float *mean, struct LayerNorm *ln, f
 // var2 = sum(dout * ln_weight dim = -1)/c*std ---> over C
 // var3 = (x - mean) * sum(dout * ln_weight * (x - mean), dim = -1)/c*std^3 ---> over C
 void layernorm_backprop(float *input, float *dinput, float *doutput, struct LayerNorm *ln, struct dLayerNorm *dln, const float *mean, const float *std, int B, int T, int C) {
-    float epsilon = 1e-5f;
-    float c = (float)C;
-
     for (int i = 0; i < B * T; i++) {
-        float sum_dout = 0.0f;
-        float sum_dout_x = 0.0f;
+        float var2 = 0.0f;
+        float var3 = 0.0f;
+
+        // Calculate var2 and var3
         for (int j = 0; j < C; j++) {
-            float x = input[i * C + j];
-            float dout = doutput[i * C + j];
-            sum_dout += dout;
-            sum_dout_x += dout * (x - mean[i]);
-            dln->dln1_weight[j] += dout * (x - mean[i]) / std[i];
-            dln->dln1_bias[j] += dout;
+            var2 += doutput[i * C + j] * ln->ln1_weight[j];
+            var3 += (input[i * C + j] - mean[i]) * doutput[i * C + j] * ln->ln1_weight[j];
         }
-        
+
+        var2 = var2 / (C * std[i]);
+        var3 = var3 / (C * std[i] * std[i] * std[i]);
+
+        // Calculate gradients
         for (int j = 0; j < C; j++) {
-            float x = input[i * C + j];
-            float dout = doutput[i * C + j];
-            dinput[i * C + j] += ln->ln1_weight[j] / std[i] * (dout - sum_dout / c - (x - mean[i]) / (c * std[i] * std[i]) * sum_dout_x);
+            float norm = (input[i * C + j] - mean[i]) / std[i];
+            float var1 = doutput[i * C + j] * ln->ln1_weight[j] / std[i];
+
+            dinput[i * C + j] = var1 - var2 - var3 * (input[i * C + j] - mean[i]);
+            dln->dln1_weight[j] += doutput[i * C + j] * norm;
+            dln->dln1_bias[j] += doutput[i * C + j];
         }
     }
 }
@@ -252,7 +262,6 @@ void CausalAttention(float *input, float *output, struct AttentionBlock *attn, s
     for (int i = 0; i < B; i++) {
         for (int n = 0; n < N; n++) {
             for (int j = 0; j < T; j++) {
-
                 float *query = io->qkv + i * T * 3 * C + j * 3 * C + n * head_size;
                 float maxi = -INFINITY;
                 // stage 2--> Q @ K
@@ -261,30 +270,34 @@ void CausalAttention(float *input, float *output, struct AttentionBlock *attn, s
                     float *key = io->qkv + i * T * 3 * C + k * 3 * C + n * head_size + C;
                     float score = 0.0f;
                     for (int h = 0; h < head_size; h++) {
-                        score += (query[h] * key[h]) / (sqrtf((float)head_size));
+                        score += (query[h] * key[h]) / (sqrt(head_size));
                     }
                     io->attn_scores[i * N * T * T + n * T * T + j * T + k] = score;
-                    maxi = fmaxf(maxi, score);
+                    maxi = maxi > score ? maxi : score;
                 }
                 // we have calculated scores for a single row in the T x T self att matrix, now we apply softmax and matmul with V
                 //softmax(x) = exp(x - max)/sum(exp(x - max)), x-max for numerical stability
                 float expsum = 0.0f;
-                for (int k = 0; k < T; k++) {
-                    if (k <= j) {
-                        expsum += expf(io->attn_scores[i * N * T * T + n * T * T + j * T + k] - maxi);// lower triangular matrix
-                    }
-                    else {
-                        io->attn_scores[i * N * T * T + n * T * T + j * T + k] = -INFINITY;
-                    }
+                for (int k = 0; k <= j; k++) {
+                    float exp_score = expf(io->attn_scores[i * N * T * T + n * T * T + j * T + k] - maxi);
+                    io->attn_scores[i * N * T * T + n * T * T + j * T + k] = exp_score;
+                    expsum += exp_score;
                 }
-                for (int k = 0; k < T; k++) {
-                    io->attn_scores[i * N * T * T + n * T * T + j * T + k] = expf(io->attn_scores[i * N * T * T + n * T * T + j * T + k] - maxi) / expsum;
+                for (int k = j + 1; k < T; k++) {
+                    io->attn_scores[i * N * T * T + n * T * T + j * T + k] = 0.0f;
+                }
+                // Normalize the softmax probabilities
+                for (int k = 0; k <= j; k++) {
+                    io->attn_scores[i * N * T * T + n * T * T + j * T + k] /= expsum;
                 }
                 // stage 3 --> attn_scores @ V
-                for (int k = 0; k < T; k++) {
+                float *out_ptr = io->causal_attention + i * T * C + j * C + n * head_size;
+                memset(out_ptr, 0, head_size * sizeof(float));
+                for (int k = 0; k <= j; k++) {
                     float *value = io->qkv + i * T * 3 * C + k * 3 * C + n * head_size + 2 * C;
+                    float attn_score = io->attn_scores[i * N * T * T + n * T * T + j * T + k];
                     for (int h = 0; h < head_size; h++) {
-                        io->causal_attention[i * T * C + j * C + n * head_size + h] += io->attn_scores[i * N * T * T + n * T * T + j * T + k] * value[h];
+                        out_ptr[h] += attn_score * value[h];
                     }
                 }
             }
@@ -296,66 +309,57 @@ void CausalAttention(float *input, float *output, struct AttentionBlock *attn, s
 }
 
 void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlock *dAtt, struct ip_op *io, int B, int T, int C, int num_heads) {
+
     float *dattn = (float *)calloc(B * T * C, sizeof(float));
     int N = num_heads;
     int H = C / N;
-    float scale = 1.0f / sqrtf((float)H);
-
     // stage 3
     matmul_backprop(io->causal_attention, attn->proj_weight, io->datt_out, dattn, dAtt->dproj_weight, dAtt->dproj_bias, T, C, C, B);
-
-    // stage 2
+    //stage 2
     float *dqkv = (float *)calloc(B * T * 3 * C, sizeof(float));
     float *dscores = (float *)calloc(B * N * T * T, sizeof(float));
-
     #pragma omp parallel for collapse(3)
+
     for(int i = 0; i < B; i++){
         for(int j = 0; j < N; j++){
             for(int k = 0; k < T; k++){
-                int idx1 = i * T * 3 * C + k * 3 * C + j * H;
-                int idx2 = i * N * T * T + j * T * T + k * T;
-                int idx3 = i * T * C + k * C + j * H;
-
-                // Compute dV
-                for(int l = 0; l <= k; l++){
+                int idx1 = i * T * 3 * C + k * 3 * C + j * H;// indexing qkv
+                int idx2 = i * T * T * N + j * T * T + k * T;// indexing attn_scores
+                int idx3 = i * T * C + k * C + j * H;// indexing attn
+                for(int l = 0; l < T; l++){
                     for(int h = 0; h < H; h++){
-                        dqkv[idx1 + 2*C + h] += io->attn_scores[idx2 + l] * dattn[idx3 + h];
+                        // attn_scores--> T, T  ; value --> T, H
+                        dqkv[idx1 + 2*C + h] += io->attn_scores[idx2 + l] * dattn[h];
+                        dscores[idx2 + l] += io->qkv[idx1 + 2*C + h] * dattn[h];
                     }
                 }
-
-                // Compute dscores
-                for(int l = 0; l <= k; l++){
-                    for(int h = 0; h < H; h++){
-                        dscores[idx2 + l] += io->qkv[idx1 + 2*C + h] * dattn[idx3 + h];
-                    }
-                }
-
-                // Softmax gradient
-                float sum_dscores = 0.0f;
-                for(int l = 0; l <= k; l++){
-                    sum_dscores += dscores[idx2 + l] * io->attn_scores[idx2 + l];
-                }
-                for(int l = 0; l <= k; l++){
+                // now for softmax's turn, in forward pass we filled upper triangular matrix with -inf and simultaneously calculated exp sum finally applying exp/expsum
+                // wonderful blog https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
+                // derivative = softmax(x) * (1 - softmax(x)) if input idx(x) == ouput idx(y) else -softmax(x) * softmax(y)
+                float *dattn_raw = (float *)calloc(T, sizeof(float));
+                for(int l = 0; l < T; l++){
                     float temp = io->attn_scores[idx2 + l];
-                    dscores[idx2 + l] = temp * (dscores[idx2 + l] - sum_dscores);
+                    float der = dscores[idx2 + l];
+                    if(l == k){
+                        dattn_raw[l] = (temp * (1 - temp))*der;
+                    }
+                    else{
+                        dattn_raw[l] = (-temp * io->attn_scores[idx2 + k])*der;
+                    }
                 }
-
-                // Compute dQ and dK
-                for(int l = 0; l <= k; l++){
+                // now attn_raw = (q @ k)/sqrt(H), attn_raw--> T, T; q--> T, H; k--> T, H
+                // dq = dattn_raw @ K
+                // dk = dattn_raw @ Q
+                for(int l = 0; l < T; l++){
                     for(int h = 0; h < H; h++){
-                        dqkv[idx1 + h] += scale * io->qkv[idx1 + C + l*H + h] * dscores[idx2 + l];
-                        dqkv[idx1 + C + l*H + h] += scale * io->qkv[idx1 + h] * dscores[idx2 + l];
+                        dqkv[idx1 + h] = io->qkv[idx1 + C + h] * dattn_raw[l];
+                        dqkv[idx1 + C + h] = io->qkv[idx1 + h] * dattn_raw[l];
                     }
                 }
             }
         }
     }
-
-    matmul_backprop(io->ln_out1, attn->attn_weight, dqkv, io->dln_out1, dAtt->dattn_weight, dAtt->dattn_bias, T, C, 3*C, B);
-
-    free(dattn);
-    free(dqkv);
-    free(dscores);
+    matmul_backprop(io->ln_out1, attn->attn_weight, dqkv, io->dln_out1, dAtt->dattn_weight, dAtt->dattn_bias, T, 3 * C, C, B);
 }
 
 // Softmax = log(exp(logits)/sum(exp(logits))) = logits - log(sum(exp(logits)))
