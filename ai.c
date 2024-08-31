@@ -660,25 +660,9 @@ void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, str
         }
         printf("Max gradient: %e, Avg gradient: %e\n", max_grad, avg_grad);
         
-        // Log some predictions
-        printf("Sample predictions:\n");
-        for (int i = 0; i < 5; i++) {
-            int idx = rand() % (B * T);
-            int target = f->input[idx];
-            int pred = 0;
-            float max_prob = -INFINITY;
-            for (int j = 0; j < V; j++) {
-                if (f->fl_output[idx * V + j] > max_prob) {
-                    max_prob = f->fl_output[idx * V + j];
-                    pred = j;
-                }
-            }
-            printf("  Target: %d, Prediction: %d, Confidence: %f\n", target, pred, max_prob);
-        }
+        
     }
 
-    
-    // Update parameters
     update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, V*C, lr);
     update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, T*C, lr);
     
