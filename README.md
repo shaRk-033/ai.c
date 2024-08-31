@@ -1,6 +1,6 @@
 #### gpt2 written in plain C
 
-The main goal of this small project was to educate myself on how things are built from scratch, and I hope to convince at least a single person that they could build anything from scratch. Andrej Karpathy's llm.c and micrograd were the projects that motivated me to build this.
+The main goal of this small project is to educate myself on how things are built from scratch, and I hope to convince at least a single person that they could build anything from scratch. Andrej Karpathy's llm.c and micrograd were the projects that motivated me to build this.
 
 #### things I learnt building this:
 
@@ -25,6 +25,9 @@ Some compiler flags to optimize the performance: -O3 -march=native -funroll-loop
 - [Fast MMM on CPU](https://siboehm.com/articles/22/Fast-MMM-on-CPU)
 
 This implementation isn't the most optimal approach; there are lots of things to improve.
+
+#### references:
+- [gpt in python](https://github.com/shaRk-033/GPT_MINI)
 
 #### TODO:
 - Improve the Matrix Multiplication.
