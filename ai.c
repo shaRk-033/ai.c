@@ -1,3 +1,4 @@
+// bruh dont read the below code; just look at it, admire its beauty. this isnt chatgpt for god's sake, dont try to fix this pls(ik it doesnt train)
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/time.h>
