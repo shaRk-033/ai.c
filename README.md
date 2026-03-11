@@ -11,14 +11,40 @@ The main goal of this small project is to educate myself on how things are built
 
 It was fun building something like this.
 
-#### compiler flags
+#### quick start
 
-Some compiler flags to optimize the performance: -O3 -march=native -funroll-loops -fopenmp
+tokenize the training data (needs tiktoken):
+```
+pip install tiktoken
+python3 prep_data.py
+```
+
+compile and run:
+```
+# macOS (uses Apple Accelerate for fast matmul)
+gcc -O3 -DACCELERATE_NEW_LAPACK -o train ai.c -lm -framework Accelerate
+
+# linux with openmp
+gcc -O3 -march=native -funroll-loops -fopenmp -o train ai.c -lm
+```
+
+```
+./train
+```
+
+decode generated tokens:
+```
+python3 decode.py "464,1182,286,..."
+```
+
+#### compiler flags
 
 - `-O3`: Aggressive optimizations
 - `-march=native`: CPU-specific optimizations
 - `-funroll-loops`: Loop unrolling for potential speed improvements
 - `-fopenmp`: OpenMP support for parallel processing
+- `-framework Accelerate`: Apple's BLAS for fast matrix multiplication (macOS only)
+- `-DACCELERATE_NEW_LAPACK`: use the updated cblas interface on macOS
 
 #### blogs that helped me a lot:
 - [Matrix Multiplication on CPU](https://marek.ai/matrix-multiplication-on-cpu.html)

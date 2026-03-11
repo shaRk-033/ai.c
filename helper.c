@@ -633,33 +633,22 @@ size_t calculate_ip_op_size(int b, int t, int c, int n, int N){
     return total_size;
 }
 
-size_t calculate_foo_size(int b, int t, int c){
-    int total_size = b * (
-        sizeof(int) * t +              // input
-        sizeof(float) * t * c +        // emb_output
-        sizeof(float) * t * c +        // fln_output
-        sizeof(float) * t +            // fln_mean
-        sizeof(float) * t +            // fln_std
-        sizeof(float) * t * c +        // fl_output
-        sizeof(float) * t * c +        // demb_output
-        sizeof(float) * t * c +        // dfln_output
-        sizeof(float) * t * c          // dfl_output
-    );
+size_t calculate_foo_size(int b, int t, int c, int v){
+    size_t total_size =
+        sizeof(int) * b * t +              // input
+        sizeof(float) * b * t * c +        // emb_output
+        sizeof(float) * b * t * c +        // fln_output
+        sizeof(float) * b * t +            // fln_mean
+        sizeof(float) * b * t +            // fln_std
+        sizeof(float) * b * t * v +        // fl_output
+        sizeof(float) * b * t * c +        // demb_output
+        sizeof(float) * b * t * c +        // dfln_output
+        sizeof(float) * b * t * v;         // dfl_output
     return total_size;
 }
 
-void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
-    size_t total_size = b * (
-        sizeof(int) * t +              // input
-        sizeof(float) * t * c +        // emb_output
-        sizeof(float) * t * c +        // fln_output
-        sizeof(float) * t +            // fln_mean
-        sizeof(float) * t +            // fln_std
-        sizeof(float) * t * c +        // fl_output
-        sizeof(float) * t * c +        // demb_output
-        sizeof(float) * t * c +        // dfln_output
-        sizeof(float) * t * c          // dfl_output
-    );
+void map_foo(struct foo* model, const char* filename, int b, int t, int c, int v) {
+    size_t total_size = calculate_foo_size(b, t, c, v);
 
     float* map = mmap_file(filename, total_size);
     if (!map) {
@@ -685,7 +674,7 @@ void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
     current_ptr += b * t;
 
     model->fl_output = (float*)current_ptr;
-    current_ptr += b * t * c;
+    current_ptr += b * t * v;
 
     model->demb_output = (float*)current_ptr;
     current_ptr += b * t * c;
@@ -694,23 +683,11 @@ void map_foo(struct foo* model, const char* filename, int b, int t, int c) {
     current_ptr += b * t * c;
 
     model->dfl_output = (float*)current_ptr;
-    current_ptr += b * t * c;
+    current_ptr += b * t * v;
 }
-void unmap_foo(struct foo* model, int b, int t, int c) {
-    // Unmap file
-    float* map = (float*)model->input; // Assuming input points to the start of the mapped file
-    size_t total_size = b * (
-        sizeof(int) * t +              // input
-        sizeof(float) * t * c +        // emb_output
-        sizeof(float) * t * c +        // fln_output
-        sizeof(float) * t +            // fln_mean
-        sizeof(float) * t +            // fln_std
-        sizeof(float) * t * c +        // fl_output
-        sizeof(float) * t * c +        // demb_output
-        sizeof(float) * t * c          // dfl_output
-    );
-
-    // Unmap the memory
+void unmap_foo(struct foo* model, int b, int t, int c, int v) {
+    float* map = (float*)model->input;
+    size_t total_size = calculate_foo_size(b, t, c, v);
     unmap_file(map, total_size);
 }
 

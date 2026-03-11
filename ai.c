@@ -8,7 +8,11 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#endif
 #include "helper.c"
+#include "adamw.c"
 #define SQRT_2_OVER_PI 0.7978845608028654
 #define const1 0.5
 #define const2 0.044715
@@ -65,26 +69,32 @@ void gelu_backprop(float *input, float *dinput, float *doutput, int size) {
 
 void matmul(const float *inp, const float *weight, float *bias, float *out, int m, int k, int n, int B)
 {
-
-    #pragma omp parallel for collapse(2)
-    for (int batch = 0; batch < B; batch++)
-    {
-        for (int i = 0; i < m; i++)
-        {
+    // init output with bias
+    for (int batch = 0; batch < B; batch++) {
+        for (int i = 0; i < m; i++) {
             int b_i = batch * m * n + i * n;
-            for (int l = 0; l < k; l++)
-            {
-                for (int j = 0; j < n; j++)
-                {
-                    if (l == 0)
-                    {
-                        out[b_i + j] = bias == NULL ? 0.0f : bias[j];
-                    }
+            for (int j = 0; j < n; j++) {
+                out[b_i + j] = bias == NULL ? 0.0f : bias[j];
+            }
+        }
+    }
+    // out += inp @ weight, inp is (B*m, k), weight is (k, n)
+#ifdef __APPLE__
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                B * m, n, k, 1.0f, inp, k, weight, n, 1.0f, out, n);
+#else
+    #pragma omp parallel for collapse(2)
+    for (int batch = 0; batch < B; batch++) {
+        for (int i = 0; i < m; i++) {
+            int b_i = batch * m * n + i * n;
+            for (int l = 0; l < k; l++) {
+                for (int j = 0; j < n; j++) {
                     out[b_i + j] += inp[batch * m * k + i * k + l] * weight[l * n + j];
                 }
             }
         }
     }
+#endif
 }
 // out = inp @ weight + bias--> dinp = dout @ (weight).T
 // dweight = (dinp).T @ dout, dbias = dout.sum()
@@ -316,6 +326,7 @@ void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlo
     float *dattn = (float *)calloc(B * T * C, sizeof(float));
     int N = num_heads;
     int H = C / N;
+    float scale = 1.0f / sqrtf((float)H);
     // stage 3
     matmul_backprop(io->causal_attention, attn->proj_weight, io->datt_out, dattn, dAtt->dproj_weight, dAtt->dproj_bias, T, C, C, B);
     //stage 2
@@ -329,40 +340,44 @@ void causal_attention_backprop(struct AttentionBlock *attn, struct dAttentionBlo
                 int idx1 = i * T * 3 * C + k * 3 * C + j * H;// indexing qkv
                 int idx2 = i * T * T * N + j * T * T + k * T;// indexing attn_scores
                 int idx3 = i * T * C + k * C + j * H;// indexing attn
-                for(int l = 0; l < T; l++){
+                // backprop through attn_scores @ V
+                for(int l = 0; l <= k; l++){
+                    int vidx = i * T * 3 * C + l * 3 * C + j * H;// qkv at key/value position l
                     for(int h = 0; h < H; h++){
-                        // attn_scores--> T, T  ; value --> T, H
-                        dqkv[idx1 + 2*C + h] += io->attn_scores[idx2 + l] * dattn[h];
-                        dscores[idx2 + l] += io->qkv[idx1 + 2*C + h] * dattn[h];
+                        dqkv[vidx + 2*C + h] += io->attn_scores[idx2 + l] * dattn[idx3 + h];
+                        dscores[idx2 + l] += io->qkv[vidx + 2*C + h] * dattn[idx3 + h];
                     }
                 }
-                // now for softmax's turn, in forward pass we filled upper triangular matrix with -inf and simultaneously calculated exp sum finally applying exp/expsum
-                // wonderful blog https://eli.thegreenplace.net/2016/the-softmax-function-and-its-derivative/
-                // derivative = softmax(x) * (1 - softmax(x)) if input idx(x) == ouput idx(y) else -softmax(x) * softmax(y)
+                // softmax backward: dL/da[k,l] = sum_m dL/dS[k,m] * dS[k,m]/da[k,l]
+                // jacobian entries are S_i*(1-S_i) diagonal, -S_i*S_j off diagonal
+                // summing the full VJP simplifies to: dL/da_l = S_l * (dL/dS_l - dot(S, dL/dS))
+                float dot = 0.0f;
+                for(int l = 0; l <= k; l++){
+                    dot += io->attn_scores[idx2 + l] * dscores[idx2 + l];
+                }
                 float *dattn_raw = (float *)calloc(T, sizeof(float));
-                for(int l = 0; l < T; l++){
-                    float temp = io->attn_scores[idx2 + l];
-                    float der = dscores[idx2 + l];
-                    if(l == k){
-                        dattn_raw[l] = (temp * (1 - temp))*der;
-                    }
-                    else{
-                        dattn_raw[l] = (-temp * io->attn_scores[idx2 + k])*der;
-                    }
+                for(int l = 0; l <= k; l++){
+                    dattn_raw[l] = io->attn_scores[idx2 + l] * (dscores[idx2 + l] - dot);
                 }
-                // now attn_raw = (q @ k)/sqrt(H), attn_raw--> T, T; q--> T, H; k--> T, H
-                // dq = dattn_raw @ K
-                // dk = dattn_raw @ Q
-                for(int l = 0; l < T; l++){
+                // raw score = q[k] @ k[l] / sqrt(H), so grads need position l's key and the scale
+                // dq[k,h] += sum_l dattn_raw[l] * K[l,h] / sqrt(H)
+                // dk[l,h] += dattn_raw[l] * Q[k,h] / sqrt(H)
+                for(int l = 0; l <= k; l++){
+                    int kidx = i * T * 3 * C + l * 3 * C + j * H;
                     for(int h = 0; h < H; h++){
-                        dqkv[idx1 + h] = io->qkv[idx1 + C + h] * dattn_raw[l];
-                        dqkv[idx1 + C + h] = io->qkv[idx1 + h] * dattn_raw[l];
+                        dqkv[idx1 + h] += dattn_raw[l] * io->qkv[kidx + C + h] * scale;
+                        dqkv[kidx + C + h] += dattn_raw[l] * io->qkv[idx1 + h] * scale;
                     }
                 }
+                free(dattn_raw);
             }
         }
     }
-    matmul_backprop(io->ln_out1, attn->attn_weight, dqkv, io->dln_out1, dAtt->dattn_weight, dAtt->dattn_bias, T, 3 * C, C, B);
+    // forward was matmul(inp, weight, bias, out, T, C, 3*C, B) so backprop dims match
+    matmul_backprop(io->ln_out1, attn->attn_weight, dqkv, io->dln_out1, dAtt->dattn_weight, dAtt->dattn_bias, T, C, 3 * C, B);
+    free(dattn);
+    free(dqkv);
+    free(dscores);
 }
 
 // Softmax = log(exp(logits)/sum(exp(logits))) = logits - log(sum(exp(logits)))
@@ -607,32 +622,33 @@ void update_grad_stats(float *grad, int size, float *max_grad, float *avg_grad, 
     }
 }
 
-void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, struct ip_op *io[], struct foo *f, int total_steps ,int step_no){
+// m and v use same struct layout as dGpt, reusing map_dgpt to allocate
+void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel,
+              struct dGpt *m, struct dGpt *v, struct AdamW *opt,
+              struct ip_op *io[], struct foo *f, int total_steps, int step_no){
     int B = config->batch_size;
     int T = config->seq_len;
     int C = config->d_model;
     int V = config->vocab_size;
     int N = config->num_heads;
     int n = config->n_layers;
-    int warmup_steps = 100;  // Reduced warmup steps
-    float base_lr = 1e-3;  // Increased base learning rate
+    int warmup_steps = 100;
+    float base_lr = 3e-4;
     float lr = lr_scheduler(base_lr, step_no, warmup_steps, total_steps);
-    
-    // Clip gradients
-    clip_gradients(dmodel, 1.0, B, T, C, V, n);  // Max norm of 1.0
-    
-    // Log training progress
+    opt->t = step_no + 1;
+
+    // clip gradients
+    clip_gradients(dmodel, 1.0, B, T, C, V, n);
+
+    // log training progress
     if (step_no % 10 == 0) {
         printf("Step %d: LR = %e\n", step_no, lr);
-        // Log gradient statistics
         float max_grad = 0.0f, avg_grad = 0.0f;
         int grad_count = 0;
 
-        // Embedding gradients
         update_grad_stats(dmodel->dembedding->dinp_emb, V * C, &max_grad, &avg_grad, &grad_count);
         update_grad_stats(dmodel->dembedding->dpos_emb, T * C, &max_grad, &avg_grad, &grad_count);
 
-        // Decoder layer gradients
         for (int i = 0; i < n; i++) {
             update_grad_stats(dmodel->ddecoder_layer[i]->dln1->dln1_weight, C, &max_grad, &avg_grad, &grad_count);
             update_grad_stats(dmodel->ddecoder_layer[i]->dln1->dln1_bias, C, &max_grad, &avg_grad, &grad_count);
@@ -648,43 +664,43 @@ void gpt_step(struct Config *config, struct gpt *model, struct dGpt *dmodel, str
             update_grad_stats(dmodel->ddecoder_layer[i]->dmlp->d_proj_bias, C, &max_grad, &avg_grad, &grad_count);
         }
 
-        // Final layer norm gradients
         update_grad_stats(dmodel->dlnf->dln1_weight, C, &max_grad, &avg_grad, &grad_count);
         update_grad_stats(dmodel->dlnf->dln1_bias, C, &max_grad, &avg_grad, &grad_count);
-
-        // Final layer gradients
         update_grad_stats(dmodel->dfinal_layer->dfinal_weight, C * V, &max_grad, &avg_grad, &grad_count);
         update_grad_stats(dmodel->dfinal_layer->dfinal_bias, V, &max_grad, &avg_grad, &grad_count);
 
-        if (grad_count > 0) {
-            avg_grad /= grad_count;
-        }
+        if (grad_count > 0) avg_grad /= grad_count;
         printf("Max gradient: %e, Avg gradient: %e\n", max_grad, avg_grad);
-        
-        
     }
 
-    update_params(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, V*C, lr);
-    update_params(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, T*C, lr);
-    
+    // embeddings -- weight decay on embeddings
+    adamw_update(model->embedding->inp_emb, dmodel->dembedding->dinp_emb, m->dembedding->dinp_emb, v->dembedding->dinp_emb, V*C, lr, opt);
+    adamw_update(model->embedding->pos_emb, dmodel->dembedding->dpos_emb, m->dembedding->dpos_emb, v->dembedding->dpos_emb, T*C, lr, opt);
+
     for(int i = 0; i < n; i++){
-        update_params(model->decoder_layer[i]->ln1->ln1_weight, dmodel->ddecoder_layer[i]->dln1->dln1_weight, C, lr);
-        update_params(model->decoder_layer[i]->ln1->ln1_bias, dmodel->ddecoder_layer[i]->dln1->dln1_bias, C, lr);
-        update_params(model->decoder_layer[i]->causal_attention->attn_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_weight, C*3*C, lr);
-        update_params(model->decoder_layer[i]->causal_attention->attn_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_bias, 3*C, lr);
-        update_params(model->decoder_layer[i]->causal_attention->proj_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_weight, C*C, lr);
-        update_params(model->decoder_layer[i]->causal_attention->proj_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_bias, C, lr);
-        update_params(model->decoder_layer[i]->ln2->ln1_weight, dmodel->ddecoder_layer[i]->dln2->dln1_weight, C, lr);
-        update_params(model->decoder_layer[i]->ln2->ln1_bias, dmodel->ddecoder_layer[i]->dln2->dln1_bias, C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_fc_weight, dmodel->ddecoder_layer[i]->dmlp->d_fc_weight, C*4*C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, 4*C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_proj_weight, dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, 4*C*C, lr);
-        update_params(model->decoder_layer[i]->mlp->c_proj_bias, dmodel->ddecoder_layer[i]->dmlp->d_proj_bias, C, lr);
+        // layernorm -- no weight decay
+        adamw_update_no_wd(model->decoder_layer[i]->ln1->ln1_weight, dmodel->ddecoder_layer[i]->dln1->dln1_weight, m->ddecoder_layer[i]->dln1->dln1_weight, v->ddecoder_layer[i]->dln1->dln1_weight, C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->ln1->ln1_bias, dmodel->ddecoder_layer[i]->dln1->dln1_bias, m->ddecoder_layer[i]->dln1->dln1_bias, v->ddecoder_layer[i]->dln1->dln1_bias, C, lr, opt);
+        // attention weights -- weight decay, biases -- no wd
+        adamw_update(model->decoder_layer[i]->causal_attention->attn_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_weight, m->ddecoder_layer[i]->dcausal_attention->dattn_weight, v->ddecoder_layer[i]->dcausal_attention->dattn_weight, C*3*C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->causal_attention->attn_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dattn_bias, m->ddecoder_layer[i]->dcausal_attention->dattn_bias, v->ddecoder_layer[i]->dcausal_attention->dattn_bias, 3*C, lr, opt);
+        adamw_update(model->decoder_layer[i]->causal_attention->proj_weight, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_weight, m->ddecoder_layer[i]->dcausal_attention->dproj_weight, v->ddecoder_layer[i]->dcausal_attention->dproj_weight, C*C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->causal_attention->proj_bias, dmodel->ddecoder_layer[i]->dcausal_attention->dproj_bias, m->ddecoder_layer[i]->dcausal_attention->dproj_bias, v->ddecoder_layer[i]->dcausal_attention->dproj_bias, C, lr, opt);
+        // layernorm 2
+        adamw_update_no_wd(model->decoder_layer[i]->ln2->ln1_weight, dmodel->ddecoder_layer[i]->dln2->dln1_weight, m->ddecoder_layer[i]->dln2->dln1_weight, v->ddecoder_layer[i]->dln2->dln1_weight, C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->ln2->ln1_bias, dmodel->ddecoder_layer[i]->dln2->dln1_bias, m->ddecoder_layer[i]->dln2->dln1_bias, v->ddecoder_layer[i]->dln2->dln1_bias, C, lr, opt);
+        // mlp weights -- weight decay, biases -- no wd
+        adamw_update(model->decoder_layer[i]->mlp->c_fc_weight, dmodel->ddecoder_layer[i]->dmlp->d_fc_weight, m->ddecoder_layer[i]->dmlp->d_fc_weight, v->ddecoder_layer[i]->dmlp->d_fc_weight, C*4*C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->mlp->c_fc_bias, dmodel->ddecoder_layer[i]->dmlp->d_fc_bias, m->ddecoder_layer[i]->dmlp->d_fc_bias, v->ddecoder_layer[i]->dmlp->d_fc_bias, 4*C, lr, opt);
+        adamw_update(model->decoder_layer[i]->mlp->c_proj_weight, dmodel->ddecoder_layer[i]->dmlp->d_proj_weight, m->ddecoder_layer[i]->dmlp->d_proj_weight, v->ddecoder_layer[i]->dmlp->d_proj_weight, 4*C*C, lr, opt);
+        adamw_update_no_wd(model->decoder_layer[i]->mlp->c_proj_bias, dmodel->ddecoder_layer[i]->dmlp->d_proj_bias, m->ddecoder_layer[i]->dmlp->d_proj_bias, v->ddecoder_layer[i]->dmlp->d_proj_bias, C, lr, opt);
     }
-    update_params(model->lnf->ln1_weight, dmodel->dlnf->dln1_weight, C, lr);
-    update_params(model->lnf->ln1_bias, dmodel->dlnf->dln1_bias, C, lr);
-    update_params(model->final_layer->final_weight, dmodel->dfinal_layer->dfinal_weight, C*V, lr);
-    update_params(model->final_layer->final_bias, dmodel->dfinal_layer->dfinal_bias, V, lr);
+    // final layernorm -- no wd
+    adamw_update_no_wd(model->lnf->ln1_weight, dmodel->dlnf->dln1_weight, m->dlnf->dln1_weight, v->dlnf->dln1_weight, C, lr, opt);
+    adamw_update_no_wd(model->lnf->ln1_bias, dmodel->dlnf->dln1_bias, m->dlnf->dln1_bias, v->dlnf->dln1_bias, C, lr, opt);
+    // final layer
+    adamw_update(model->final_layer->final_weight, dmodel->dfinal_layer->dfinal_weight, m->dfinal_layer->dfinal_weight, v->dfinal_layer->dfinal_weight, C*V, lr, opt);
+    adamw_update_no_wd(model->final_layer->final_bias, dmodel->dfinal_layer->dfinal_bias, m->dfinal_layer->dfinal_bias, v->dfinal_layer->dfinal_bias, V, lr, opt);
 }
 
 // generating random numbers from normal distribution using Box Muller transform
@@ -819,6 +835,78 @@ int* read_tokens_from_file(const char *filename, int *num_indices) {
     return indices;
 }
 
+// sample next token from logits with temperature
+int sample_token(float *logits, int V, float temperature) {
+    float max_logit = -INFINITY;
+    for (int i = 0; i < V; i++) {
+        max_logit = fmaxf(max_logit, logits[i] / temperature);
+    }
+    float sum = 0.0f;
+    float *probs = (float *)malloc(V * sizeof(float));
+    for (int i = 0; i < V; i++) {
+        probs[i] = expf(logits[i] / temperature - max_logit);
+        sum += probs[i];
+    }
+    // random sample from distribution
+    float r = ((float)rand() / RAND_MAX) * sum;
+    float cumsum = 0.0f;
+    for (int i = 0; i < V; i++) {
+        cumsum += probs[i];
+        if (cumsum >= r) {
+            free(probs);
+            return i;
+        }
+    }
+    free(probs);
+    return V - 1;
+}
+
+// autoregressive generation, uses B=1 slot of existing buffers
+void generate(struct Config *config, struct gpt *model, struct ip_op *io[], struct foo *f,
+              size_t ip_op_size, size_t foo_size, int *prompt, int prompt_len, int max_tokens, float temperature) {
+    int T = config->seq_len;
+    int V = config->vocab_size;
+    struct Config inf_config = *config;
+    inf_config.batch_size = 1;
+
+    int seq_len = prompt_len < T ? prompt_len : T;
+    // fill input with prompt
+    memset(f->input, 0, T * sizeof(int));
+    for (int i = 0; i < seq_len; i++) {
+        f->input[i] = prompt[i];
+    }
+
+    printf("\n--- generating %d tokens ---\n", max_tokens);
+    // print prompt tokens
+    for (int i = 0; i < seq_len; i++) printf("%d,", f->input[i]);
+
+    for (int step = 0; step < max_tokens; step++) {
+        // clear intermediates before each forward
+        memset(io[0]->dec_ip, 0, ip_op_size);
+
+        gpt_forward(&inf_config, model, io, f);
+
+        // logits at last filled position
+        int pos = seq_len - 1;
+        float *logits = f->fl_output + pos * V;
+        int next = sample_token(logits, V, temperature);
+
+        printf("%d,", next);
+        fflush(stdout);
+
+        // append or shift window
+        if (seq_len < T) {
+            f->input[seq_len] = next;
+            seq_len++;
+        } else {
+            for (int i = 0; i < T - 1; i++) {
+                f->input[i] = f->input[i + 1];
+            }
+            f->input[T - 1] = next;
+        }
+    }
+    printf("\n");
+}
 
 int main() {
     struct Config config = {4, 32, 8, 128, 50304, 8};
@@ -830,13 +918,21 @@ int main() {
     size_t gpt_size = calculate_total_gpt_size(B, T, C, V);
     size_t dgpt_size = calculate_total_dgpt_size(T, C, V);
     size_t ip_op_size = calculate_ip_op_size(B, T, C, NUM_LAYERS, N);
-    size_t foo_size = calculate_foo_size(B, T, C);
+    size_t foo_size = calculate_foo_size(B, T, C, V);
     map_gpt(model, "gpt.bin", B, T, C, V);
     map_dgpt(dmodel, "dgpt_model.bin", T, C, V);
     map_ip_op_array(io, "ip_op.bin", B, T, C, NUM_LAYERS, N);
-    map_foo(f, "foo.bin", B, T, C);
+    map_foo(f, "foo.bin", B, T, C, V);
+    // adamw moment buffers, same layout as gradients
+    struct dGpt *m_state = (struct dGpt *)malloc(sizeof(struct dGpt));
+    struct dGpt *v_state = (struct dGpt *)malloc(sizeof(struct dGpt));
+    map_dgpt(m_state, "adam_m.bin", T, C, V);
+    map_dgpt(v_state, "adam_v.bin", T, C, V);
+    struct AdamW opt = {0.9f, 0.999f, 1e-8f, 0.01f, 0};
     init_gpt(model, T, C, V, N, NUM_LAYERS);
     _zero_grad(dmodel, dgpt_size);
+    _zero_grad(m_state, dgpt_size);
+    _zero_grad(v_state, dgpt_size);
     reset_io_foo(io, f, ip_op_size, foo_size);
 
     // we'll use tokens generated from a python script, TODO : build tokenizer in C
@@ -848,7 +944,7 @@ int main() {
     int* tokens = read_tokens_from_file("output.txt", &num_indices);
     
     // training loop
-    int steps = 1000;
+    int steps = 10000;
     for(int i = 0; i < steps; i++){
         int *targets = (int *)calloc(B * T, sizeof(int));
         
@@ -866,11 +962,15 @@ int main() {
         _zero_grad(dmodel, dgpt_size);
         loss_backward(f->fl_output, targets, f->dfl_output, B, T, V);
         gpt_backward(&config, model, dmodel, io, f);
-        gpt_step(&config, model, dmodel, io, f, steps, i);
+        gpt_step(&config, model, dmodel, m_state, v_state, &opt, io, f, steps, i);
         reset_io_foo(io, f, ip_op_size, foo_size);
         
         free(targets);
     }
+
+    // generate some text after training, seed with first few tokens
+    int prompt[] = {464, 1182, 286};  // "The end of"
+    generate(&config, model, io, f, ip_op_size, foo_size, prompt, 3, 128, 0.8f);
 
     return 0;
 }
