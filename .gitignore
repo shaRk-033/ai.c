@@ -5,6 +5,7 @@
 # Binary files
 *.bin
 *
+!*.py
 
 # Object files
 *.o
